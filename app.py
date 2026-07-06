@@ -300,7 +300,7 @@ def preparar_data(peu_raw, accesos_raw):
     col_ruta_peu = buscar_columna(peu, ["ruta", "tab_ruta", "bdga_cdg"])
     col_ruta_acc = buscar_columna(accesos, ["ruta"])
     col_clase = buscar_columna(peu, ["clase_ruta", "clase de ruta", "base2"])
-    col_tipo = buscar_columna(peu, ["tipo_ruta", "tipo de ruta", "operacion"])
+    col_tipo = buscar_columna(peu, ["tipo_ruta", "tipo de ruta", "base1"])
     col_fecha_peu = buscar_columna(peu, ["a_operacion", "fecha_operacion", "fecha de operación"])
     col_hora_peu = buscar_columna(peu, ["hora_gestion", "hora de gestion", "hora de gestión"])
     col_fecha_acc = buscar_columna(accesos, ["solo_fch", "solo fecha", "fecha_ingreso", "fecha de ingreso"])
