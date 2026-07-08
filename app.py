@@ -299,7 +299,7 @@ def preparar_data(peu_raw, accesos_raw):
     col_ruta_peu = buscar_columna(peu, ["ruta", "tab_ruta", "bdga_cdg"])
     col_ruta_acc = buscar_columna(accesos, ["ruta"])
     col_clase = buscar_columna(peu, ["clase_ruta", "clase de ruta", "base2"])
-    col_tipo = buscar_columna(peu, ["tipo_ruta", "tipo de ruta", "base1"])
+    col_tipo = buscar_columna(peu, ["base1", "base 1", "tipo_ruta", "tipo de ruta", "operacion"])
     col_fecha_peu = buscar_columna(peu, ["a_operacion", "fecha_operacion", "fecha de operación"])
     col_hora_peu = buscar_columna(peu, ["hora_gestion", "hora de gestion", "hora de gestión"])
     col_fecha_acc = buscar_columna(accesos, ["solo_fch", "solo fecha", "fecha_ingreso", "fecha de ingreso"])
@@ -700,12 +700,16 @@ def optimizar_cached(puntos, flota, escenario, usar_osrm_matrix=True, usar_osrm_
         demand = routing.RegisterUnaryTransitCallback(demand_cb)
         vehicle_caps = [int(max(1, math.floor(float(c) * CAP_SCALE))) for c in vehiculos["capacidad"]]
         routing.AddDimensionWithVehicleCapacity(demand, 0, vehicle_caps, True, "Capacity")
-        routing.SetFixedCostOfAllVmax_cap = float(vehiculos["capacidad"].max())
 
-       for v in range(n_veh):
+        max_cap = float(vehiculos["capacidad"].max())
+
+        for v in range(n_veh):
           cap = float(vehiculos.loc[v, "capacidad"])
           penalizacion_menor_capacidad = int((max_cap - cap) * 100000)
-          routing.SetFixedCostOfVehicle(1000000 + penalizacion_menor_capacidad, v)ehicles(1000000)
+          routing.SetFixedCostOfVehicle(
+              1000000 + penalizacion_menor_capacidad, v
+          )
+
         params = pywrapcp.DefaultRoutingSearchParameters()
         params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
