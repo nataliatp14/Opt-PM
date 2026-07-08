@@ -39,6 +39,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-title">Baseline Operacional + Optimizador PM</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Comparación automática: Baseline vs Optimización de ruta vs Optimización de capacidades</div>', unsafe_allow_html=True)
 
 HUB_LAT = -33.43291
 HUB_LON = -70.797027
