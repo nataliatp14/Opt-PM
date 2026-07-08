@@ -22,9 +22,9 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.block-container{padding-top:1rem;padding-bottom:1rem;}
-[data-testid="stHeader"]{height:0rem;}
-.main-title{font-size:2.2rem;font-weight:850;margin-bottom:.1rem;}
+.block-container{    padding-top:2.5rem;    padding-bottom:1rem;}
+[data-testid="stHeader"]{    height:3rem;}
+.main-title{font-size:2.4rem; font-weight:850; margin-top:0.8rem; margin-bottom:0.8rem; line-height:1.3;}
 .subtitle{color:#667085;font-size:1rem;margin-bottom:1rem;}
 .section-title{font-size:1.35rem;font-weight:800;margin-top:.5rem;margin-bottom:.4rem;}
 .section-subtitle{color:#667085;font-size:.95rem;margin-bottom:.8rem;}
