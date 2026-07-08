@@ -56,6 +56,7 @@ TIEMPO_SERVICIO_BASE = 15
 TIEMPO_SERVICIO_OS = 0.1
 DEFAULT_CAPACIDAD = 20
 DICRUTA_DEFAULT_PATH = Path("dicruta.xlsx")
+EVENTOS_OPTIMIZABLES = ["PU", "CSC", "CNP", "NHP"]
 
 # Capacidad del diccionario viene en m3.
 # El volumen operativo del optimizador se calcula en m3 desde kilo mayor.
@@ -448,33 +449,91 @@ def get_route_geometry(coords_tuple, usar_osrm=True):
 
 def preparar_puntos(df, cols, max_capacidad=None, dicruta=None):
     lat_col, lon_col = cols["lat_col"], cols["lon_col"]
-    col_reserva, col_q_os, col_km, col_piezas = cols["col_reserva"], cols["col_q_os"], cols["col_km"], cols["col_piezas"]
-    if not lat_col or not lon_col: return pd.DataFrame()
-    d = df.dropna(subset=[lat_col, lon_col]).copy()
-    d = d[d["evento_norm"].eq("PU")].copy()
-    if d.empty: return pd.DataFrame()
-    d["id_punto_opt"] = d[col_reserva].astype(str) if col_reserva else d[lat_col].round(6).astype(str)+"_"+d[lon_col].round(6).astype(str)
-    d["_os"] = pd.to_numeric(d[col_q_os], errors="coerce").fillna(1) if col_q_os else 1
-    d.loc[d["_os"] <= 0, "_os"] = 1
-    d["_kilo"] = pd.to_numeric(d[col_km], errors="coerce").fillna(0).clip(lower=0) if col_km else 0
+    col_reserva, col_q_os, col_km, col_piezas = (
+        cols["col_reserva"],
+        cols["col_q_os"],
+        cols["col_km"],
+        cols["col_piezas"],
+    )
 
-    # Volumen/capacidad: la demanda se convierte desde kilo mayor a m3.
-    # Si m3 por OS supera 3.0, se corrige usando Capmax de la ruta en dicruta.
-    capmax_map = dicruta.set_index("ruta")["capmax"].to_dict() if dicruta is not None and "capmax" in dicruta.columns else {}
+    if not lat_col or not lon_col:
+        return pd.DataFrame()
+
+    # ==========================================================
+    # Solo se optimizan PU + excepciones obligatorias
+    # ==========================================================
+    d = df.dropna(subset=[lat_col, lon_col]).copy()
+    d = d[d["evento_norm"].isin(EVENTOS_OPTIMIZABLES)].copy()
+
+    if d.empty:
+        return pd.DataFrame()
+
+    # Marca las excepciones que deben visitarse sin carga
+    d["_es_visita_sin_carga"] = d["evento_norm"].isin(["CSC", "CNP", "NHP"])
+
+    d["id_punto_opt"] = (
+        d[col_reserva].astype(str)
+        if col_reserva
+        else d[lat_col].round(6).astype(str) + "_" + d[lon_col].round(6).astype(str)
+    )
+
+    d["_os"] = (
+        pd.to_numeric(d[col_q_os], errors="coerce").fillna(1)
+        if col_q_os
+        else 1
+    )
+    d.loc[d["_os"] <= 0, "_os"] = 1
+
+    d["_kilo"] = (
+        pd.to_numeric(d[col_km], errors="coerce").fillna(0).clip(lower=0)
+        if col_km
+        else 0
+    )
+
+    # ==========================================================
+    # Volumen usando Capmax
+    # ==========================================================
+    capmax_map = (
+        dicruta.set_index("ruta")["capmax"].to_dict()
+        if dicruta is not None and "capmax" in dicruta.columns
+        else {}
+    )
+
     d["_capmax_ruta"] = d["ruta"].map(capmax_map)
+
     if col_km:
-        ajuste_vol = ajustar_volumen_m3(d[col_km], d["_os"], capmax_por_os=d["_capmax_ruta"], umbral_m3_por_os=3.0, m3_estandar_por_os=0.33)
+        ajuste_vol = ajustar_volumen_m3(
+            d[col_km],
+            d["_os"],
+            capmax_por_os=d["_capmax_ruta"],
+            umbral_m3_por_os=3.0,
+            m3_estandar_por_os=0.33,
+        )
+
         d["_volumen_original"] = ajuste_vol["volumen_original_m3"]
         d["_volumen"] = ajuste_vol["volumen_m3"]
         d["_m3_por_os"] = ajuste_vol["m3_por_os"]
         d["_capmax_usado"] = ajuste_vol["capmax_usado"]
         d["_volumen_ajustado"] = ajuste_vol["volumen_ajustado"]
+
     else:
         d["_volumen_original"] = 0
         d["_volumen"] = 0
         d["_m3_por_os"] = 0
         d["_capmax_usado"] = d["_capmax_ruta"].fillna(0)
         d["_volumen_ajustado"] = False
+
+    # ==========================================================
+    # Las excepciones (CSC/CNP/NHP) se VISITAN,
+    # pero NO consumen capacidad ni carga.
+    # ==========================================================
+    d.loc[d["_es_visita_sin_carga"], "_os"] = 0
+    d.loc[d["_es_visita_sin_carga"], "_kilo"] = 0
+    d.loc[d["_es_visita_sin_carga"], "_volumen_original"] = 0
+    d.loc[d["_es_visita_sin_carga"], "_volumen"] = 0
+    d.loc[d["_es_visita_sin_carga"], "_m3_por_os"] = 0
+    d.loc[d["_es_visita_sin_carga"], "_volumen_ajustado"] = False
+
     group_cols = ["id_punto_opt", lat_col, lon_col, "ventana_inicio", "ventana_fin"]
     opt = d.groupby(group_cols, dropna=False).agg(
         os=("_os", "sum"),
