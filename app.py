@@ -39,7 +39,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-title">Baseline Operacional + Optimizador PM</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Comparación automática: Baseline vs Optimización de ruta vs Optimización de capacidades</div>', unsafe_allow_html=True)
 
 HUB_LAT = -33.43291
 HUB_LON = -70.797027
@@ -701,7 +700,12 @@ def optimizar_cached(puntos, flota, escenario, usar_osrm_matrix=True, usar_osrm_
         demand = routing.RegisterUnaryTransitCallback(demand_cb)
         vehicle_caps = [int(max(1, math.floor(float(c) * CAP_SCALE))) for c in vehiculos["capacidad"]]
         routing.AddDimensionWithVehicleCapacity(demand, 0, vehicle_caps, True, "Capacity")
-        routing.SetFixedCostOfAllVehicles(1000000)
+        routing.SetFixedCostOfAllVmax_cap = float(vehiculos["capacidad"].max())
+
+       for v in range(n_veh):
+          cap = float(vehiculos.loc[v, "capacidad"])
+          penalizacion_menor_capacidad = int((max_cap - cap) * 100000)
+          routing.SetFixedCostOfVehicle(1000000 + penalizacion_menor_capacidad, v)ehicles(1000000)
         params = pywrapcp.DefaultRoutingSearchParameters()
         params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
         params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
