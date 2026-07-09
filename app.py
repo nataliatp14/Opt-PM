@@ -1160,12 +1160,13 @@ def preparar_mapa_opt(routes):
 def render_map(stops, paths, title, key_prefix="mapa"):
     st.markdown(f"#### {title}")
     if stops.empty or paths.empty:
-        st.warning("No hay puntos para mostrar."); return
+        st.warning("No hay puntos para mostrar."); 
+        return
 
     # Filtro por bloque AM / PM cuando exista la columna bloque
-if "bloque" in stops.columns:
-    bloques_disponibles = sorted([str(x) for x in stops["bloque"].dropna().unique()])
-    bloque_sel = st.selectbox(
+    if "bloque" in stops.columns:
+      bloques_disponibles = sorted([str(x) for x in stops["bloque"].dropna().unique()])
+      bloque_sel = st.selectbox(
         "Ver bloque",
         ["Todos"] + bloques_disponibles,
         key=f"{key_prefix}_bloque_visible"
