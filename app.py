@@ -1125,32 +1125,54 @@ def resumen_por_vuelta_baseline(baseline, dicruta, cols):
 
 def preparar_mapa_baseline(baseline, cols):
     lat_col, lon_col = cols["lat_col"], cols["lon_col"]
-    if not lat_col or not lon_col: return pd.DataFrame(), pd.DataFrame()
-    mapa = baseline.dropna(subset=[lat_col, lon_col]).sort_values(["ruta","vuelta","datetime_gestion"]).copy()
-    if mapa.empty: return pd.DataFrame(), pd.DataFrame()
-    mapa["orden"] = mapa.groupby(["ruta","vuelta"]).cumcount()+1
-    mapa["orden_txt"] = mapa["orden"].astype(str)
-    mapa["bloque"] = np.where(
-    mapa["datetime_gestion"].dt.hour < 14,
-    "AM",
-    "PM")
-    mapa["color"] = mapa.apply(lambda r: color_from_text(f"BL-{r['ruta']}-{r['vuelta']}"), axis=1)
-    paths=[]
-    for (ruta,vuelta), g in mapa.groupby(["ruta","vuelta"], dropna=False):
-        coords = [HUB_COORD] + [(float(r[lat_col]), float(r[lon_col])) for _,r in g.iterrows()] + [HUB_COORD]
-        geom, ok, km = get_route_geometry(tuple(coords), usar_osrm=True)
-        bloque_path = "AM" if g["datetime_gestion"].dt.hour.min() < 14 else "PM"
+    if not lat_col or not lon_col:
+        return pd.DataFrame(), pd.DataFrame()
 
-    paths.append({
-        "ruta": ruta,
-        "vuelta": str(vuelta),
-        "id": f"{ruta}-{vuelta}",
-        "bloque": bloque_path,
-        "path": [[lon,lat] for lat,lon in geom],
-        "color": color_from_text(f"BL-{ruta}-{vuelta}"),
-        "km_estimado": km
-         })
-    mapa = mapa.rename(columns={lat_col:"lat", lon_col:"lon"})
+    mapa = baseline.dropna(subset=[lat_col, lon_col]).sort_values(
+        ["ruta", "vuelta", "datetime_gestion"]
+    ).copy()
+
+    if mapa.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    mapa["orden"] = mapa.groupby(["ruta", "vuelta"]).cumcount() + 1
+    mapa["orden_txt"] = mapa["orden"].astype(str)
+
+    # Bloque por hora real de gestión
+    mapa["bloque"] = np.where(
+        mapa["datetime_gestion"].dt.hour < 14,
+        "AM",
+        "PM"
+    )
+
+    mapa["color"] = mapa.apply(
+        lambda r: color_from_text(f"BL-{r['ruta']}-{r['vuelta']}"),
+        axis=1
+    )
+
+    paths = []
+
+    # Se arma una ruta por ruta + vuelta + bloque
+    for (ruta, vuelta, bloque), g in mapa.groupby(["ruta", "vuelta", "bloque"], dropna=False):
+        coords = [HUB_COORD] + [
+            (float(r[lat_col]), float(r[lon_col])) for _, r in g.iterrows()
+        ] + [HUB_COORD]
+
+        geom, ok, km = get_route_geometry(tuple(coords), usar_osrm=True)
+
+        paths.append({
+            "ruta": ruta,
+            "vehiculo_base": ruta,
+            "vuelta": str(vuelta),
+            "bloque": bloque,
+            "id": f"{ruta}-{vuelta}-{bloque}",
+            "path": [[lon, lat] for lat, lon in geom],
+            "color": color_from_text(f"BL-{ruta}-{vuelta}-{bloque}"),
+            "km_estimado": km
+        })
+
+    mapa = mapa.rename(columns={lat_col: "lat", lon_col: "lon"})
+
     return mapa, pd.DataFrame(paths)
 
 def preparar_mapa_opt(routes):
