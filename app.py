@@ -1145,12 +1145,13 @@ def preparar_mapa_opt(routes):
         veh = str(r.get("vehiculo_base", ""))
         vuelta = str(r.get("vuelta", ""))
         paths.append({
-            "id": f"{veh}-V{vuelta}",
-            "vehiculo_base": veh,
-            "ruta": veh,
-            "vuelta": vuelta,
-            "path": [[lon,lat] for lat,lon in r["geometry"]],
-            "color": r["color"]
+                "id": f"{veh}-V{vuelta}",
+                "vehiculo_base": veh,
+                "ruta": veh,
+                "vuelta": vuelta,
+                "bloque": r.get("bloque", ""),
+                "path": [[lon,lat] for lat,lon in r["geometry"]],
+                "color": r["color"]
         })
         for s in r["stops"]:
             row=s.copy(); row["color"]=r["color"]; row["orden_txt"]=str(row["secuencia"]); stops.append(row)
@@ -1161,11 +1162,29 @@ def render_map(stops, paths, title, key_prefix="mapa"):
     if stops.empty or paths.empty:
         st.warning("No hay puntos para mostrar."); return
 
-    # Filtro simple para presentar una sola ruta/vehículo sin recalcular el optimizador.
-    ruta_col = "vehiculo_base" if "vehiculo_base" in stops.columns else "ruta"
-    opciones = sorted([str(x) for x in stops[ruta_col].dropna().unique()])
-    ver_todas = "Todas"
-    seleccion = st.selectbox("Ver ruta / vehículo", [ver_todas] + opciones, key=f"{key_prefix}_ruta_visible")
+    # Filtro por bloque AM / PM cuando exista la columna bloque
+if "bloque" in stops.columns:
+    bloques_disponibles = sorted([str(x) for x in stops["bloque"].dropna().unique()])
+    bloque_sel = st.selectbox(
+        "Ver bloque",
+        ["Todos"] + bloques_disponibles,
+        key=f"{key_prefix}_bloque_visible"
+    )
+
+    if bloque_sel != "Todos":
+        stops = stops[stops["bloque"].astype(str) == bloque_sel].copy()
+        if "bloque" in paths.columns:
+            paths = paths[paths["bloque"].astype(str) == bloque_sel].copy()
+
+# Filtro simple para presentar una sola ruta/vehículo sin recalcular el optimizador.
+ruta_col = "vehiculo_base" if "vehiculo_base" in stops.columns else "ruta"
+opciones = sorted([str(x) for x in stops[ruta_col].dropna().unique()])
+ver_todas = "Todas"
+seleccion = st.selectbox(
+    "Ver ruta / vehículo",
+    [ver_todas] + opciones,
+    key=f"{key_prefix}_ruta_visible"
+)
     if seleccion != ver_todas:
         stops = stops[stops[ruta_col].astype(str) == seleccion].copy()
         if "vehiculo_base" in paths.columns:
