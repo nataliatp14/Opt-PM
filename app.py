@@ -1159,35 +1159,40 @@ def preparar_mapa_opt(routes):
 
 def render_map(stops, paths, title, key_prefix="mapa"):
     st.markdown(f"#### {title}")
+
     if stops.empty or paths.empty:
-        st.warning("No hay puntos para mostrar."); 
+        st.warning("No hay puntos para mostrar.")
         return
 
-    # Filtro por bloque AM / PM cuando exista la columna bloque
+    # Filtro por bloque AM / PM
     if "bloque" in stops.columns:
-      bloques_disponibles = sorted([str(x) for x in stops["bloque"].dropna().unique()])
-      bloque_sel = st.selectbox(
-        "Ver bloque",
-        ["Todos"] + bloques_disponibles,
-        key=f"{key_prefix}_bloque_visible"
+        bloques_disponibles = sorted([str(x) for x in stops["bloque"].dropna().unique()])
+
+        bloque_sel = st.selectbox(
+            "Ver bloque",
+            ["Todos"] + bloques_disponibles,
+            key=f"{key_prefix}_bloque_visible"
+        )
+
+        if bloque_sel != "Todos":
+            stops = stops[stops["bloque"].astype(str) == bloque_sel].copy()
+
+            if "bloque" in paths.columns:
+                paths = paths[paths["bloque"].astype(str) == bloque_sel].copy()
+
+    # Filtro por ruta / vehículo
+    ruta_col = "vehiculo_base" if "vehiculo_base" in stops.columns else "ruta"
+    opciones = sorted([str(x) for x in stops[ruta_col].dropna().unique()])
+
+    seleccion = st.selectbox(
+        "Ver ruta / vehículo",
+        ["Todas"] + opciones,
+        key=f"{key_prefix}_ruta_visible"
     )
 
-    if bloque_sel != "Todos":
-        stops = stops[stops["bloque"].astype(str) == bloque_sel].copy()
-        if "bloque" in paths.columns:
-            paths = paths[paths["bloque"].astype(str) == bloque_sel].copy()
-
-# Filtro simple para presentar una sola ruta/vehículo sin recalcular el optimizador.
-ruta_col = "vehiculo_base" if "vehiculo_base" in stops.columns else "ruta"
-opciones = sorted([str(x) for x in stops[ruta_col].dropna().unique()])
-ver_todas = "Todas"
-seleccion = st.selectbox(
-    "Ver ruta / vehículo",
-    [ver_todas] + opciones,
-    key=f"{key_prefix}_ruta_visible"
-)
-    if seleccion != ver_todas:
+    if seleccion != "Todas":
         stops = stops[stops[ruta_col].astype(str) == seleccion].copy()
+
         if "vehiculo_base" in paths.columns:
             paths = paths[paths["vehiculo_base"].astype(str) == seleccion].copy()
         elif "ruta" in paths.columns:
@@ -1196,17 +1201,80 @@ seleccion = st.selectbox(
             paths = paths[paths["id"].astype(str).str.startswith(seleccion)].copy()
 
     if stops.empty or paths.empty:
-        st.warning("No hay puntos para la ruta seleccionada."); return
+        st.warning("No hay puntos para la selección realizada.")
+        return
 
-    path_layer = pdk.Layer("PathLayer", data=paths, get_path="path", get_width=8, width_min_pixels=4, get_color="color", pickable=True)
-    point_layer = pdk.Layer("ScatterplotLayer", data=stops, get_position="[lon, lat]", get_radius=105, get_fill_color="color", get_line_color=[255,255,255], line_width_min_pixels=3, pickable=True)
-    text_layer = pdk.Layer("TextLayer", data=stops, get_position="[lon, lat]", get_text="orden_txt", get_size=14, get_color=[255,255,255,255], get_text_anchor="'middle'", get_alignment_baseline="'center'")
-    hub = pd.DataFrame([{"lat":HUB_LAT,"lon":HUB_LON,"color":[255,170,0,245],"nombre":"HUB1"}])
-    hub_layer = pdk.Layer("ScatterplotLayer", data=hub, get_position="[lon, lat]", get_radius=220, get_fill_color="color", get_line_color=[255,255,255], line_width_min_pixels=3, pickable=True)
-    view = pdk.ViewState(latitude=stops["lat"].mean(), longitude=stops["lon"].mean(), zoom=10, pitch=0)
-    tooltip = {"html":"<b>ID:</b> {id_punto_opt}<br/><b>Ruta:</b> {ruta}<br/><b>Vehículo:</b> {vehiculo_base}<br/><b>Vuelta:</b> {vuelta}<br/><b>Orden:</b> {orden}<br/><b>ETA:</b> {eta}<br/><b>OS:</b> {os}<br/><b>Volumen m³:</b> {volumen}", "style":{"backgroundColor":"white","color":"black"}}
-    st.pydeck_chart(pdk.Deck(map_style="light", layers=[path_layer, point_layer, text_layer, hub_layer], initial_view_state=view, tooltip=tooltip), use_container_width=True)
+    path_layer = pdk.Layer(
+        "PathLayer",
+        data=paths,
+        get_path="path",
+        get_width=8,
+        width_min_pixels=4,
+        get_color="color",
+        pickable=True
+    )
 
+    point_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=stops,
+        get_position="[lon, lat]",
+        get_radius=105,
+        get_fill_color="color",
+        get_line_color=[255, 255, 255],
+        line_width_min_pixels=3,
+        pickable=True
+    )
+
+    text_layer = pdk.Layer(
+        "TextLayer",
+        data=stops,
+        get_position="[lon, lat]",
+        get_text="orden_txt",
+        get_size=14,
+        get_color=[255, 255, 255, 255],
+        get_text_anchor="'middle'",
+        get_alignment_baseline="'center'"
+    )
+
+    hub = pd.DataFrame([{
+        "lat": HUB_LAT,
+        "lon": HUB_LON,
+        "color": [255, 170, 0, 245],
+        "nombre": "HUB1"
+    }])
+
+    hub_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=hub,
+        get_position="[lon, lat]",
+        get_radius=220,
+        get_fill_color="color",
+        get_line_color=[255, 255, 255],
+        line_width_min_pixels=3,
+        pickable=True
+    )
+
+    view = pdk.ViewState(
+        latitude=stops["lat"].mean(),
+        longitude=stops["lon"].mean(),
+        zoom=10,
+        pitch=0
+    )
+
+    tooltip = {
+        "html": "<b>ID:</b> {id_punto_opt}<br/><b>Ruta:</b> {ruta}<br/><b>Vehículo:</b> {vehiculo_base}<br/><b>Vuelta:</b> {vuelta}<br/><b>Bloque:</b> {bloque}<br/><b>Orden:</b> {orden_txt}<br/><b>ETA:</b> {eta}<br/><b>OS:</b> {os}<br/><b>Volumen m³:</b> {volumen}",
+        "style": {"backgroundColor": "white", "color": "black"}
+    }
+
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="light",
+            layers=[path_layer, point_layer, text_layer, hub_layer],
+            initial_view_state=view,
+            tooltip=tooltip
+        ),
+        use_container_width=True
+    )
 # ============================================================
 # SIDEBAR / INPUTS
 # ============================================================
