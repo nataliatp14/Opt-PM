@@ -281,6 +281,7 @@ def cargar_dicruta(file_or_path):
     col_tipo_flota = buscar_columna(dic, ["tipo flota", "tipo_flota"])
     col_capmax = buscar_columna(dic, ["capmax", "cap_max", "cap max", "capacidad_os", "capacidad os", "prom_os_m3", "prom os m3"])
     col_horario = buscar_columna(dic, ["horario", "hora", "hora_inicio", "hora inicio", "inicio ruta", "inicio_ruta"])
+    col_propio = buscar_columna(dic, ["propio", "es_propio", "ruta propia", "vehiculo propio", "vehículo propio"])
     if col_ruta is None or col_cap is None:
         raise ValueError("El diccionario de rutas debe tener columnas Ruta y Capacidad.")
     out = dic.copy()
@@ -291,7 +292,23 @@ def cargar_dicruta(file_or_path):
     # Horario define desde qué minuto del día puede activarse la ruta en escenarios optimizados.
     out["horario_min"] = out[col_horario].apply(time_to_minutes) if col_horario else np.nan
     out["horario_txt"] = out["horario_min"].apply(lambda x: minutes_to_time(x) if pd.notna(x) else "Sin restricción")
-    return out.dropna(subset=["ruta"])[["ruta", "capacidad", "tipo_flota", "capmax", "horario_min", "horario_txt"]].drop_duplicates("ruta")
+
+    # Identifica rutas/vehículos propios desde la nueva columna del diccionario.
+    if col_propio:
+        propio_txt = (
+            out[col_propio]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+            .str.replace("Í", "I", regex=False)
+        )
+        out["es_propio"] = propio_txt.isin(["SI", "S", "YES", "Y", "TRUE", "1"])
+    else:
+        out["es_propio"] = False
+
+    return out.dropna(subset=["ruta"])[[
+        "ruta", "capacidad", "tipo_flota", "capmax", "horario_min", "horario_txt", "es_propio"
+    ]].drop_duplicates("ruta")
 
 @st.cache_data(show_spinner=False)
 def preparar_data(peu_raw, accesos_raw):
@@ -1395,40 +1412,206 @@ def completar_resumen_ruta_con_flota(resumen, flota_baseline, escenario="Optimiz
         resumen["activo"] = resumen.get("paradas", 0).fillna(0).astype(float) > 0
     return resumen
 
+
+
+def obtener_rutas_propias_detectadas(df_operacion, dicruta):
+    """Devuelve las rutas propias presentes en la operación filtrada."""
+    if df_operacion is None or df_operacion.empty or dicruta is None or dicruta.empty:
+        return []
+    if "es_propio" not in dicruta.columns:
+        return []
+    propias_dic = set(dicruta.loc[dicruta["es_propio"], "ruta"].dropna().astype(str))
+    rutas_operacion = set(df_operacion["ruta"].dropna().astype(str))
+    return sorted(propias_dic.intersection(rutas_operacion))
+
+
+def construir_configuracion_propios(df_operacion, dicruta, key_prefix="propios_global"):
+    """Muestra las decisiones previas para reservas y vehículos propios."""
+    rutas_detectadas = obtener_rutas_propias_detectadas(df_operacion, dicruta)
+
+    config_default = {
+        "rutas_propias_detectadas": rutas_detectadas,
+        "optimizar_reservas_propias": False,
+        "vehiculos_propios_incluidos": []
+    }
+
+    if not rutas_detectadas:
+        st.success("No se detectaron rutas propias en la operación filtrada.")
+        return config_default
+
+    detalle = (
+        dicruta[dicruta["ruta"].isin(rutas_detectadas)]
+        [["ruta", "capacidad", "tipo_flota"]]
+        .drop_duplicates("ruta")
+        .sort_values("ruta")
+        .reset_index(drop=True)
+    )
+
+    st.warning(
+        "Se detectaron rutas propias en la operación filtrada. "
+        "Define cómo deben tratarse antes de ejecutar los escenarios optimizados."
+    )
+    st.dataframe(
+        detalle.rename(columns={
+            "ruta": "Ruta / vehículo propio",
+            "capacidad": "Capacidad m³",
+            "tipo_flota": "Tipo de flota"
+        }),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    optimizar_reservas = st.radio(
+        "¿Deseas incluir las reservas asociadas a estas rutas propias en la optimización?",
+        ["No", "Sí"],
+        horizontal=True,
+        index=0,
+        key=f"{key_prefix}_optimizar_reservas"
+    ) == "Sí"
+
+    vehiculos_incluidos = []
+    if optimizar_reservas:
+        incluir_flota = st.radio(
+            "¿Deseas incorporar vehículos propios dentro de las opciones de flota de la optimización?",
+            ["No", "Sí"],
+            horizontal=True,
+            index=0,
+            key=f"{key_prefix}_incluir_flota"
+        ) == "Sí"
+
+        if incluir_flota:
+            detalle["opcion"] = detalle.apply(
+                lambda r: f"{r['ruta']} · {float(r['capacidad']):.1f} m³ · {r['tipo_flota']}",
+                axis=1
+            )
+            mapa = dict(zip(detalle["opcion"], detalle["ruta"]))
+            seleccion = st.multiselect(
+                "Selecciona los vehículos propios que participarán en la optimización",
+                options=detalle["opcion"].tolist(),
+                default=detalle["opcion"].tolist(),
+                key=f"{key_prefix}_vehiculos_seleccionados"
+            )
+            vehiculos_incluidos = [mapa[x] for x in seleccion]
+
+    return {
+        "rutas_propias_detectadas": rutas_detectadas,
+        "optimizar_reservas_propias": optimizar_reservas,
+        "vehiculos_propios_incluidos": vehiculos_incluidos
+    }
+
 # ============================================================
 # EJECUCIÓN AUTOMÁTICA DE ESCENARIOS
 # ============================================================
-def ejecutar_escenarios_dia(fecha, clases_sel, tipos_sel, comuna_sel=None):
+def ejecutar_escenarios_dia(
+    fecha,
+    clases_sel,
+    tipos_sel,
+    comuna_sel=None,
+    optimizar_reservas_propias=False,
+    vehiculos_propios_incluidos=None
+):
+    """Ejecuta baseline, optimización de ruta y optimización de capacidades.
+
+    Reglas para rutas propias:
+    - El baseline siempre conserva toda la operación real.
+    - Si optimizar_reservas_propias=False, sus reservas se excluyen de ambos escenarios optimizados.
+    - En capacidades, sólo los vehículos propios seleccionados quedan disponibles como flota.
+    - En optimización de ruta, una reserva propia sólo se mantiene si también fue habilitado su vehículo,
+      porque ese escenario preserva la asociación reserva-ruta original.
+    """
+    vehiculos_propios_incluidos = vehiculos_propios_incluidos or []
+
     base = peu[(peu["fecha_operacion"] == fecha) & peu["clase_ruta"].isin(clases_sel) & peu["tipo_ruta"].isin(tipos_sel)].copy()
     if comuna_sel and comuna_sel != "Todas":
         base = base[base["comuna"].eq(comuna_sel)].copy()
-    acc = accesos[accesos["solo_fch"] == fecha].sort_values(["ruta","datetime_ingreso"]).copy()
-    baseline = asignar_vueltas_por_cierre(base, acc)
-    flota_bl = construir_flotas_baseline(baseline, dicruta)
-    # Para validar capacidad de puntos usamos SOLO la capacidad máxima de la flota usada en el baseline del día.
-    # No se permite resolver con capacidades que no existieron en la operación filtrada.
-    max_capacidad_disponible = float(flota_bl["capacidad"].max()) if not flota_bl.empty else DEFAULT_CAPACIDAD
-    puntos = preparar_puntos(baseline, cols, max_capacidad=max_capacidad_disponible, dicruta=dicruta)
-    flota_cap = construir_flotas_capacidades(flota_bl, puntos["volumen"].sum() if not puntos.empty else 0)
-    routes_ruta, detail_ruta, resumen_ruta, meta_ruta = optimizar_ruta_preservando_flota(puntos, flota_bl, True)
-    routes_cap, detail_cap, resumen_cap, meta_cap = optimizar_cached(puntos, flota_cap, "Optimización de capacidades", True, True)
-    resumen_ruta = completar_resumen_ruta_con_flota(resumen_ruta, flota_bl, "Optimización de ruta")
-    met_base = metricas_baseline(baseline, dicruta, cols)
+
+    acc = accesos[accesos["solo_fch"] == fecha].sort_values(["ruta", "datetime_ingreso"]).copy()
+    baseline_completo = asignar_vueltas_por_cierre(base, acc)
+
+    propio_map = dicruta.set_index("ruta")["es_propio"].to_dict() if "es_propio" in dicruta.columns else {}
+    baseline_completo["es_ruta_propia"] = baseline_completo["ruta"].map(propio_map).fillna(False).astype(bool)
+    rutas_propias_dia = sorted(baseline_completo.loc[baseline_completo["es_ruta_propia"], "ruta"].dropna().unique())
+
+    # Demanda autorizada para optimización de capacidades.
+    if optimizar_reservas_propias:
+        baseline_cap = baseline_completo.copy()
+    else:
+        baseline_cap = baseline_completo[~baseline_completo["es_ruta_propia"]].copy()
+
+    # Demanda autorizada para optimización de ruta.
+    # Este escenario no reasigna reservas entre vehículos.
+    if optimizar_reservas_propias:
+        baseline_ruta = baseline_completo[
+            (~baseline_completo["es_ruta_propia"]) |
+            (baseline_completo["ruta"].isin(vehiculos_propios_incluidos))
+        ].copy()
+    else:
+        baseline_ruta = baseline_completo[~baseline_completo["es_ruta_propia"]].copy()
+
+    # Flota real completa del día.
+    flota_bl_completa = construir_flotas_baseline(baseline_completo, dicruta)
+    flota_bl_completa["es_propio"] = flota_bl_completa["vehiculo_base"].map(propio_map).fillna(False).astype(bool)
+
+    # Flota para optimización de capacidades: terceros + propios seleccionados.
+    flota_cap_base = flota_bl_completa[~flota_bl_completa["es_propio"]].copy()
+    if vehiculos_propios_incluidos:
+        flota_prop_sel = flota_bl_completa[
+            flota_bl_completa["vehiculo_base"].isin(vehiculos_propios_incluidos)
+        ].copy()
+        flota_cap_base = pd.concat([flota_cap_base, flota_prop_sel], ignore_index=True).drop_duplicates("vehiculo_base")
+
+    # Flota para optimización de ruta: terceros + propios seleccionados.
+    flota_ruta = flota_bl_completa[
+        (~flota_bl_completa["es_propio"]) |
+        (flota_bl_completa["vehiculo_base"].isin(vehiculos_propios_incluidos))
+    ].copy()
+
+    max_capacidad_disponible = float(flota_cap_base["capacidad"].max()) if not flota_cap_base.empty else DEFAULT_CAPACIDAD
+    puntos_cap = preparar_puntos(baseline_cap, cols, max_capacidad=max_capacidad_disponible, dicruta=dicruta)
+    puntos_ruta = preparar_puntos(baseline_ruta, cols, max_capacidad=max_capacidad_disponible, dicruta=dicruta)
+
+    flota_cap = construir_flotas_capacidades(
+        flota_cap_base,
+        puntos_cap["volumen"].sum() if not puntos_cap.empty else 0
+    )
+
+    routes_ruta, detail_ruta, resumen_ruta, meta_ruta = optimizar_ruta_preservando_flota(puntos_ruta, flota_ruta, True)
+    routes_cap, detail_cap, resumen_cap, meta_cap = optimizar_cached(puntos_cap, flota_cap, "Optimización de capacidades", True, True)
+    resumen_ruta = completar_resumen_ruta_con_flota(resumen_ruta, flota_ruta, "Optimización de ruta")
+
+    met_base = metricas_baseline(baseline_completo, dicruta, cols)
     mets = pd.DataFrame([
         met_base,
-        metricas_opt(resumen_ruta, puntos, "Optimización de ruta", rutas_base_objetivo=met_base["cantidad_rutas"]),
-        metricas_opt(resumen_cap, puntos, "Optimización de capacidades")
+        metricas_opt(resumen_ruta, puntos_ruta, "Optimización de ruta", rutas_base_objetivo=int(flota_ruta["vehiculo_base"].nunique())),
+        metricas_opt(resumen_cap, puntos_cap, "Optimización de capacidades")
     ])
-    # Para la vista ejecutiva: los escenarios optimizados representan asignaciones que respetan ventana horaria.
+
     mets.loc[mets["escenario"].isin(["Optimización de ruta", "Optimización de capacidades"]), "cumplimiento_vh"] = 100.0
-    # v9: no se fuerzan OS/reservas/volumen entre escenarios.
-    # Baseline muestra todo el contexto ejecutado; escenarios optimizados muestran solo demanda PU optimizable
-    # (eventos PU con coordenadas). Esto evita esconder excepciones o registros no optimizables.
     mets.insert(0, "fecha", fecha)
     mets.insert(1, "comuna", comuna_sel if comuna_sel else "Todas")
-    escala_usada = float(puntos["factor_escala_capacidad"].iloc[0]) if not puntos.empty and "factor_escala_capacidad" in puntos.columns else 1.0
-    return dict(baseline=baseline, puntos=puntos, metrics=mets, routes_ruta=routes_ruta, detail_ruta=detail_ruta, resumen_ruta_opt=resumen_ruta, meta_ruta=meta_ruta,
-                routes_cap=routes_cap, detail_cap=detail_cap, resumen_cap_opt=resumen_cap, meta_cap=meta_cap, escala_capacidad=escala_usada)
+    mets["reservas_propias_optimizadas"] = bool(optimizar_reservas_propias)
+    mets["vehiculos_propios_habilitados"] = ", ".join(vehiculos_propios_incluidos) if vehiculos_propios_incluidos else "Ninguno"
+
+    escala_usada = float(puntos_cap["factor_escala_capacidad"].iloc[0]) if not puntos_cap.empty and "factor_escala_capacidad" in puntos_cap.columns else 1.0
+
+    return dict(
+        baseline=baseline_completo,
+        puntos=puntos_cap,
+        puntos_ruta=puntos_ruta,
+        metrics=mets,
+        routes_ruta=routes_ruta,
+        detail_ruta=detail_ruta,
+        resumen_ruta_opt=resumen_ruta,
+        meta_ruta=meta_ruta,
+        routes_cap=routes_cap,
+        detail_cap=detail_cap,
+        resumen_cap_opt=resumen_cap,
+        meta_cap=meta_cap,
+        escala_capacidad=escala_usada,
+        rutas_propias_detectadas=rutas_propias_dia,
+        optimizar_reservas_propias=bool(optimizar_reservas_propias),
+        vehiculos_propios_incluidos=list(vehiculos_propios_incluidos)
+    )
 
 # ============================================================
 # FILTROS GENERALES
@@ -1442,6 +1625,30 @@ with fg2:
     filtro_tipos = excel_filter("Tipo ruta", tipos_disponibles, "global_tipo", tipos_disponibles)
 with fg3:
     filtro_comuna = excel_single_filter("Comuna", ["Todas"] + comunas_disponibles, "global_comuna", default_comuna)
+
+
+# ============================================================
+# CONFIGURACIÓN DE RUTAS PROPIAS
+# ============================================================
+st.markdown('<div class="section-title">Tratamiento de rutas propias</div>', unsafe_allow_html=True)
+st.caption("Esta decisión se aplica a todos los escenarios y días ejecutados con los filtros actuales.")
+
+operacion_filtrada_propios = peu[
+    peu["clase_ruta"].isin(filtro_clases) &
+    peu["tipo_ruta"].isin(filtro_tipos)
+].copy()
+if filtro_comuna and filtro_comuna != "Todas":
+    operacion_filtrada_propios = operacion_filtrada_propios[
+        operacion_filtrada_propios["comuna"].eq(filtro_comuna)
+    ].copy()
+
+config_propios = construir_configuracion_propios(
+    operacion_filtrada_propios,
+    dicruta,
+    key_prefix="config_propios_global"
+)
+optimizar_reservas_propias = config_propios["optimizar_reservas_propias"]
+vehiculos_propios_incluidos = config_propios["vehiculos_propios_incluidos"]
 
 # ============================================================
 # TABS
@@ -1467,7 +1674,11 @@ with tab_analisis:
     rows=[]
     prog = st.progress(0, text="Ejecutando escenarios diarios automáticamente...") if fechas else None
     for i, f in enumerate(fechas):
-        res = ejecutar_escenarios_dia(f, clases_sel, tipos_sel, comuna_sel)
+        res = ejecutar_escenarios_dia(
+            f, clases_sel, tipos_sel, comuna_sel,
+            optimizar_reservas_propias=optimizar_reservas_propias,
+            vehiculos_propios_incluidos=vehiculos_propios_incluidos
+        )
         rows.append(res["metrics"])
         if prog: prog.progress((i+1)/len(fechas), text=f"Escenarios calculados: {i+1}/{len(fechas)}")
     if prog: prog.empty()
@@ -1534,7 +1745,11 @@ with tab_macro:
     if not fecha_sel:
         st.warning("No hay fechas disponibles."); st.stop()
     with st.spinner("Calculando baseline y simulaciones automáticamente..."):
-        sim = ejecutar_escenarios_dia(fecha_sel, clases_dia, tipos_dia, comuna_dia)
+        sim = ejecutar_escenarios_dia(
+            fecha_sel, clases_dia, tipos_dia, comuna_dia,
+            optimizar_reservas_propias=optimizar_reservas_propias,
+            vehiculos_propios_incluidos=vehiculos_propios_incluidos
+        )
     st.session_state["sim_dia"] = sim
 
     fecha_mostrar = pd.to_datetime(fecha_sel).strftime("%d-%m-%Y")
@@ -1659,7 +1874,11 @@ with tab_exportar:
             sims=[]
             prog = st.progress(0, text="Preparando descarga...")
             for i, f in enumerate(fechas_sel_exp):
-                sim_tmp = ejecutar_escenarios_dia(f, clases_exp, tipos_exp, comuna_exp)
+                sim_tmp = ejecutar_escenarios_dia(
+                    f, clases_exp, tipos_exp, comuna_exp,
+                    optimizar_reservas_propias=optimizar_reservas_propias,
+                    vehiculos_propios_incluidos=vehiculos_propios_incluidos
+                )
                 sims.append((f, sim_tmp))
                 prog.progress((i+1)/len(fechas_sel_exp), text=f"Días preparados: {i+1}/{len(fechas_sel_exp)}")
             prog.empty()
