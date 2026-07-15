@@ -42,7 +42,7 @@ st.markdown("""
 
 st.markdown('<div class="main-title">Baseline Operacional + Optimizador PM</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Comparación automática: Baseline vs Optimización de ruta vs Optimización de capacidades</div>', unsafe_allow_html=True)
-st.caption(f"Versión {APP_VERSION}")
+
 
 HUB_LAT = -33.43291
 HUB_LON = -70.797027
@@ -72,8 +72,7 @@ OSRM_MAX_MATRIX_POINTS = int(os.getenv("OSRM_MAX_MATRIX_POINTS", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
 DISABLE_OSRM = os.getenv("DISABLE_OSRM", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
 
-# Identificador visible para soporte y control de versión.
-APP_VERSION = "v19-produccion"
+
 
 # Capacidad del diccionario viene en m3.
 # El volumen operativo del optimizador se calcula en m3 desde kilo mayor.
@@ -1477,7 +1476,6 @@ with st.sidebar:
     archivo_dicruta = st.file_uploader("Diccionario de rutas/capacidad (opcional)", type=["xlsx"], key="dicruta")
     st.caption("Si no cargas dicruta, el aplicativo intentará leer un archivo fijo llamado dicruta.xlsx junto al .py.")
     with st.expander("Información técnica", expanded=False):
-        st.caption(f"Versión: {APP_VERSION}")
         st.caption(f"OR-Tools: hasta {ORTOOLS_MAX_PUNTOS} puntos · límite {ORTOOLS_TIME_LIMIT_SECONDS}s")
         st.caption(f"OSRM: {'deshabilitado' if DISABLE_OSRM else 'habilitado'}")
         if st.button("Limpiar caché", use_container_width=True):
