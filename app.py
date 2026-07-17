@@ -71,6 +71,13 @@ OSRM_ROUTE_TIMEOUT_SECONDS = int(os.getenv("OSRM_ROUTE_TIMEOUT_SECONDS", "12"))
 OSRM_MAX_MATRIX_POINTS = int(os.getenv("OSRM_MAX_MATRIX_POINTS", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
 PENALIZACION_RUTA_NO_PRIORIZADA = int(os.getenv("PENALIZACION_RUTA_NO_PRIORIZADA", "5000"))
+# Costo fijo que paga el solver por cada vehículo/vuelta que decide abrir.
+# Es la palanca principal para el objetivo "menos rutas, mayor ocupación":
+# mientras más alto, más agresivamente el optimizador consolida carga en
+# menos vehículos antes de abrir uno adicional. Debe mantenerse menor que
+# PENALIZACION_RUTA_NO_PRIORIZADA para que la prioridad de tipo de ruta
+# siga pesando más que la sola apertura de un vehículo adicional.
+COSTO_FIJO_VEHICULO_ABIERTO = int(os.getenv("COSTO_FIJO_VEHICULO_ABIERTO", "2500"))
 DISABLE_OSRM = os.getenv("DISABLE_OSRM", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
 
 
@@ -127,40 +134,6 @@ def kilo_mayor_a_m3(valor):
     """
     return (pd.to_numeric(valor, errors="coerce").fillna(0) / 250).clip(lower=0)
 
-def ajustar_volumen_m3(kilo_mayor, q_os, ajuste_vol_por_os=None, umbral_m3_por_os=3.0, m3_estandar_por_os=0.33):
-    """Ajusta cubicaciones erráticas usando AjusteVol del diccionario de rutas.
-
-    1) Convierte kilo mayor a m3.
-    2) Calcula m3 por OS: volumen_m3 / q_os.
-    3) Si m3_por_os supera el umbral, reemplaza el volumen total por:
-       q_os * AjusteVol de la ruta.
-       Si la ruta no tiene AjusteVol válido, usa q_os * m3_estandar_por_os como respaldo.
-    """
-    volumen_original = kilo_mayor_a_m3(kilo_mayor)
-    os = pd.to_numeric(q_os, errors="coerce").fillna(1)
-    os = os.mask(os <= 0, 1)
-
-    if ajuste_vol_por_os is None:
-        ajuste_vol = pd.Series(m3_estandar_por_os, index=volumen_original.index)
-    else:
-        ajuste_vol = pd.to_numeric(ajuste_vol_por_os, errors="coerce")
-        if not isinstance(ajuste_vol, pd.Series):
-            ajuste_vol = pd.Series(ajuste_vol, index=volumen_original.index)
-        ajuste_vol = ajuste_vol.reindex(volumen_original.index).fillna(m3_estandar_por_os)
-        ajuste_vol = ajuste_vol.mask(ajuste_vol <= 0, m3_estandar_por_os)
-
-    m3_por_os = (volumen_original / os).replace([np.inf, -np.inf], 0).fillna(0)
-    volumen_ajustado = m3_por_os > umbral_m3_por_os
-    volumen_final = volumen_original.mask(volumen_ajustado, os * ajuste_vol).clip(lower=0)
-
-    return pd.DataFrame({
-        "volumen_original_m3": volumen_original,
-        "volumen_m3": volumen_final,
-        "m3_por_os": m3_por_os,
-        "ajuste_vol_usado": ajuste_vol,
-        "volumen_ajustado": volumen_ajustado
-    })
-
 def pct(v):
     if pd.isna(v): return "-"
     return f"{float(v):.1f}%"
@@ -213,11 +186,28 @@ def concatenar_no_vacios(dataframes):
 def _filter_signature(options):
     return hashlib.md5("|".join([str(o) for o in options]).encode()).hexdigest()[:8]
 
-def excel_filter(label, options, key, default=None):
-    """Filtro tipo Excel que se resetea cuando cambia el universo de opciones.
-    Evita que queden checkboxes antiguos pegados al cambiar fecha/clase/tipo.
+def _opciones_validas_filtro(options):
+    """Ordena y descarta valores nulos: base común de ambos filtros tipo Excel."""
+    return sorted([o for o in options if pd.notna(o)])
+
+def _sincronizar_estado_filtro(selected_key, sig_key, sig, valor_inicial):
+    """Si el universo de opciones cambió respecto de la última corrida, reinicia
+    la selección guardada en session_state. Evita checkboxes/radios pegados de
+    un filtro anterior (por ejemplo, al cambiar de fecha o de clase de ruta).
     """
-    options = sorted([o for o in options if pd.notna(o)])
+    if sig_key not in st.session_state or st.session_state[sig_key] != sig:
+        st.session_state[selected_key] = valor_inicial
+        st.session_state[sig_key] = sig
+
+def _filtrar_por_busqueda(options, search):
+    return [o for o in options if search.lower() in str(o).lower()] if search else options
+
+def excel_filter(label, options, key, default=None):
+    """Filtro tipo Excel (multi-selección) que se resetea cuando cambia el
+    universo de opciones. Evita que queden checkboxes antiguos pegados al
+    cambiar fecha/clase/tipo.
+    """
+    options = _opciones_validas_filtro(options)
     if default is None:
         default = options
     default = [o for o in default if o in options]
@@ -225,9 +215,7 @@ def excel_filter(label, options, key, default=None):
     selected_key = f"{key}_selected"
     sig_key = f"{key}_options_sig"
 
-    if sig_key not in st.session_state or st.session_state[sig_key] != sig:
-        st.session_state[selected_key] = list(default)
-        st.session_state[sig_key] = sig
+    _sincronizar_estado_filtro(selected_key, sig_key, sig, list(default))
 
     # limpia selecciones que ya no existen
     st.session_state[selected_key] = [o for o in st.session_state.get(selected_key, []) if o in options]
@@ -235,7 +223,7 @@ def excel_filter(label, options, key, default=None):
     resumen = "Todos" if len(st.session_state[selected_key]) == len(options) else f"{len(st.session_state[selected_key])}/{len(options)}"
     with st.popover(f"🔽 {label}: {resumen}", use_container_width=True):
         search = st.text_input("Buscar", key=f"{key}_{sig}_search")
-        visibles = [o for o in options if search.lower() in str(o).lower()] if search else options
+        visibles = _filtrar_por_busqueda(options, search)
         c1, c2 = st.columns(2)
         if c1.button("Seleccionar todo", key=f"{key}_{sig}_all"):
             st.session_state[selected_key] = list(options)
@@ -256,7 +244,7 @@ def excel_filter(label, options, key, default=None):
 
 def excel_single_filter(label, options, key, default=None):
     """Selector único que se resetea si cambian las opciones disponibles."""
-    options = sorted([o for o in options if pd.notna(o)])
+    options = _opciones_validas_filtro(options)
     if not options:
         return None
     if default is None or default not in options:
@@ -265,13 +253,13 @@ def excel_single_filter(label, options, key, default=None):
     selected_key = f"{key}_selected_single"
     sig_key = f"{key}_options_sig_single"
 
-    if sig_key not in st.session_state or st.session_state[sig_key] != sig or st.session_state.get(selected_key) not in options:
-        st.session_state[selected_key] = default
-        st.session_state[sig_key] = sig
+    if st.session_state.get(selected_key) not in options:
+        st.session_state[sig_key] = None  # fuerza resincronización también si el valor guardado ya no es válido
+    _sincronizar_estado_filtro(selected_key, sig_key, sig, default)
 
     with st.popover(f"🔽 {label}: {st.session_state[selected_key]}", use_container_width=True):
         search = st.text_input("Buscar", key=f"{key}_{sig}_search_single")
-        visibles = [o for o in options if search.lower() in str(o).lower()] if search else options
+        visibles = _filtrar_por_busqueda(options, search)
         if visibles:
             actual = st.session_state[selected_key]
             idx = visibles.index(actual) if actual in visibles else 0
@@ -294,126 +282,6 @@ def read_excel_any(file_or_path):
         if score > best_score:
             best, best_score = df, score
     return best
-
-@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=32)
-def cargar_dicruta(file_or_path):
-    dic = read_excel_any(file_or_path).copy()
-    dic.columns = dic.columns.str.strip()
-    col_ruta = buscar_columna(dic, ["ruta"])
-    col_cap = buscar_columna(dic, ["capacidad", "capacidad_max", "capacidad máxima", "ocupacion_max", "ocupación máxima"])
-    col_tipo_flota = buscar_columna(dic, ["tipo flota", "tipo_flota"])
-    col_ajuste_vol = buscar_columna(dic, ["ajuste_vol", "cap_max", "cap max", "capacidad_os", "capacidad os", "prom_os_m3", "prom os m3"])
-    col_horario = buscar_columna(dic, ["horario", "hora", "hora_inicio", "hora inicio", "inicio ruta", "inicio_ruta"])
-    col_propio = buscar_columna(dic, ["propio", "es_propio", "ruta propia", "vehiculo propio", "vehículo propio"])
-    if col_ruta is None or col_cap is None:
-        raise ValueError("El diccionario de rutas debe tener columnas Ruta y Capacidad.")
-    out = dic.copy()
-    out["ruta"] = out[col_ruta].apply(normalizar_ruta)
-    out["capacidad"] = pd.to_numeric(out[col_cap], errors="coerce").fillna(DEFAULT_CAPACIDAD)
-    out["tipo_flota"] = out[col_tipo_flota].astype(str) if col_tipo_flota else "SIN TIPO"
-    out["ajuste_vol"] = pd.to_numeric(out[col_ajuste_vol], errors="coerce") if col_ajuste_vol else np.nan
-    # Horario define desde qué minuto del día puede activarse la ruta en escenarios optimizados.
-    out["horario_min"] = out[col_horario].apply(time_to_minutes) if col_horario else np.nan
-    out["horario_txt"] = out["horario_min"].apply(lambda x: minutes_to_time(x) if pd.notna(x) else "Sin restricción")
-
-    # Identifica rutas/vehículos propios desde la nueva columna del diccionario.
-    if col_propio:
-        propio_txt = (
-            out[col_propio]
-            .astype(str)
-            .str.upper()
-            .str.strip()
-            .str.replace("Í", "I", regex=False)
-        )
-        out["es_propio"] = propio_txt.isin(["SI", "S", "YES", "Y", "TRUE", "1"])
-    else:
-        out["es_propio"] = False
-
-    return out.dropna(subset=["ruta"])[[
-        "ruta", "capacidad", "tipo_flota", "ajuste_vol", "horario_min", "horario_txt", "es_propio"
-    ]].drop_duplicates("ruta")
-
-@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=32)
-def preparar_data(peu_raw, accesos_raw):
-    peu = peu_raw.copy(); accesos = accesos_raw.copy()
-    peu.columns = peu.columns.str.strip(); accesos.columns = accesos.columns.str.strip()
-
-    col_ruta_peu = buscar_columna(peu, ["ruta", "tab_ruta", "bdga_cdg"])
-    col_ruta_acc = buscar_columna(accesos, ["ruta"])
-    col_clase = buscar_columna(peu, ["clase_ruta", "clase de ruta", "base2"])
-    col_tipo = buscar_columna(peu, ["base1", "base 1", "tipo_ruta", "tipo de ruta", "operacion"])
-    col_fecha_peu = buscar_columna(peu, ["a_operacion", "fecha_operacion", "fecha de operación"])
-    col_hora_peu = buscar_columna(peu, ["hora_gestion", "hora de gestion", "hora de gestión"])
-    col_fecha_acc = buscar_columna(accesos, ["solo_fch", "solo fecha", "fecha_ingreso", "fecha de ingreso"])
-    col_hora_acc = buscar_columna(accesos, ["hora_entrada", "hora entrada", "hora de entrada"])
-    col_evento = buscar_columna(peu, ["evento"])
-    col_ventana = buscar_columna(peu, ["ventana_horaria", "ventana horaria", "ventana"])
-    col_inicio_vh = buscar_columna(peu, ["inicio_vh", "inicio ventana", "ventana_inicio"])
-    col_fin_vh = buscar_columna(peu, ["fin_vh", "fin ventana", "ventana_fin"])
-    col_reserva = buscar_columna(peu, ["reserva"])
-    col_comuna = buscar_columna(peu, ["comuna", "comuna_destino", "comuna destino"])
-    col_q_os = buscar_columna(peu, ["q_os", "cantidad_os", "cantidad de os"])
-    col_km = buscar_columna(peu, ["kilomayor", "kilo_mayor", "kilo mayor", "kmayor", "kmay_ajustado"])
-    col_piezas = buscar_columna(peu, ["q_piezas", "piezas", "cantidad_piezas", "volumen"])
-
-    faltantes = []
-    for nombre, col in {
-        "ruta PU": col_ruta_peu, "ruta accesos": col_ruta_acc, "clase/base2 PU": col_clase,
-        "fecha PU": col_fecha_peu, "hora PU": col_hora_peu,
-        "fecha accesos": col_fecha_acc, "hora accesos": col_hora_acc, "evento PU": col_evento,
-        "reserva PU": col_reserva
-    }.items():
-        if col is None: faltantes.append(nombre)
-    if faltantes: return None, None, None, faltantes
-
-    peu["ruta"] = peu[col_ruta_peu].apply(normalizar_ruta)
-    accesos["ruta"] = accesos[col_ruta_acc].apply(normalizar_ruta)
-    peu["clase_ruta"] = peu[col_clase].astype(str).str.upper().str.strip()
-    peu["tipo_ruta"] = peu[col_tipo].astype(str).str.upper().str.strip() if col_tipo else "SIN TIPO"
-    peu["comuna"] = peu[col_comuna].astype(str).str.upper().str.strip() if col_comuna else "SIN COMUNA"
-    peu["fecha_operacion"] = pd.to_datetime(peu[col_fecha_peu], errors="coerce").dt.date
-    accesos["solo_fch"] = pd.to_datetime(accesos[col_fecha_acc], errors="coerce").dt.date
-    peu["datetime_gestion"] = pd.to_datetime(peu["fecha_operacion"].astype(str) + " " + peu[col_hora_peu].astype(str), errors="coerce")
-    accesos["datetime_ingreso"] = pd.to_datetime(accesos["solo_fch"].astype(str) + " " + accesos[col_hora_acc].astype(str), errors="coerce")
-
-    lat_col = buscar_columna_contiene(peu, ["lat"])
-    lon_col = buscar_columna_contiene(peu, ["lon"])
-    for c in [lat_col, lon_col, col_q_os, col_km, col_piezas]:
-        if c: peu[c] = pd.to_numeric(peu[c], errors="coerce")
-    for c in [col_q_os, col_km, col_piezas]:
-        if c: peu[c] = peu[c].fillna(0)
-
-    peu["evento_norm"] = peu[col_evento].astype(str).str.upper().str.strip()
-    peu["gestion_correcta"] = peu["evento_norm"].eq("PU")
-    peu["es_excepcion"] = ~peu["gestion_correcta"]
-    peu["sin_geo"] = peu[lat_col].isna() | peu[lon_col].isna() if lat_col and lon_col else True
-
-    if col_inicio_vh and col_fin_vh:
-        peu["ventana_inicio"] = pd.to_datetime(peu[col_inicio_vh].astype(str), errors="coerce").dt.time
-        peu["ventana_fin"] = pd.to_datetime(peu[col_fin_vh].astype(str), errors="coerce").dt.time
-    elif col_ventana:
-        rangos = peu[col_ventana].apply(extraer_rango_ventana)
-        peu["ventana_inicio"] = rangos.apply(lambda x: x[0])
-        peu["ventana_fin"] = rangos.apply(lambda x: x[1])
-    else:
-        peu["ventana_inicio"] = pd.NaT; peu["ventana_fin"] = pd.NaT
-
-    def cumple_vh(row):
-        if pd.isna(row["ventana_inicio"]) or pd.isna(row["ventana_fin"]) or pd.isna(row["datetime_gestion"]):
-            return np.nan
-        fecha = row["datetime_gestion"].date()
-        ini = pd.Timestamp.combine(fecha, row["ventana_inicio"])
-        fin = pd.Timestamp.combine(fecha, row["ventana_fin"])
-        if row["ventana_inicio"] > row["ventana_fin"]: fin += pd.Timedelta(days=1)
-        return ini <= row["datetime_gestion"] <= fin
-
-    peu["cumple_ventana"] = peu.apply(cumple_vh, axis=1)
-    peu["estado_ventana"] = np.where(peu["cumple_ventana"].eq(True), "Cumple", np.where(peu["cumple_ventana"].eq(False), "No cumple", "Sin ventana válida"))
-
-    peu = peu.dropna(subset=["fecha_operacion", "datetime_gestion", "ruta"])
-    accesos = accesos.dropna(subset=["solo_fch", "datetime_ingreso", "ruta"])
-    cols = dict(col_reserva=col_reserva, col_comuna=col_comuna, col_q_os=col_q_os, col_km=col_km, col_piezas=col_piezas, lat_col=lat_col, lon_col=lon_col)
-    return peu, accesos, cols, []
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=32)
 def asignar_vueltas_por_cierre(peu_df, accesos_df):
@@ -487,125 +355,6 @@ def get_route_geometry(coords_tuple, usar_osrm=True):
         pass
     return [[lat, lon] for lat, lon in coords], False, sum(haversine_km(a[0],a[1],b[0],b[1])*1.35 for a,b in zip(coords[:-1], coords[1:]))
 
-def preparar_puntos(df, cols, max_capacidad=None, dicruta=None):
-    lat_col, lon_col = cols["lat_col"], cols["lon_col"]
-    col_reserva, col_q_os, col_km, col_piezas = (
-        cols["col_reserva"],
-        cols["col_q_os"],
-        cols["col_km"],
-        cols["col_piezas"],
-    )
-
-    if not lat_col or not lon_col:
-        return pd.DataFrame()
-
-    # ==========================================================
-    # Solo se optimizan PU + excepciones obligatorias
-    # ==========================================================
-    d = df.dropna(subset=[lat_col, lon_col]).copy()
-    d = d[d["evento_norm"].isin(EVENTOS_OPTIMIZABLES)].copy()
-
-    if d.empty:
-        return pd.DataFrame()
-
-    # Marca las excepciones que deben visitarse sin carga
-    d["_es_visita_sin_carga"] = d["evento_norm"].isin(["CSC", "CNP", "NHP"])
-
-    d["id_punto_opt"] = (
-        d[col_reserva].astype(str)
-        if col_reserva
-        else d[lat_col].round(6).astype(str) + "_" + d[lon_col].round(6).astype(str)
-    )
-
-    d["_os"] = (
-        pd.to_numeric(d[col_q_os], errors="coerce").fillna(1)
-        if col_q_os
-        else 1
-    )
-    d.loc[d["_os"] <= 0, "_os"] = 1
-
-    d["_kilo"] = (
-        pd.to_numeric(d[col_km], errors="coerce").fillna(0).clip(lower=0)
-        if col_km
-        else 0
-    )
-
-    # ==========================================================
-    # Volumen usando AjusteVol
-    # ==========================================================
-    ajuste_vol_map = (
-        dicruta.set_index("ruta")["ajuste_vol"].to_dict()
-        if dicruta is not None and "ajuste_vol" in dicruta.columns
-        else {}
-    )
-
-    d["_ajuste_vol_ruta"] = d["ruta"].map(ajuste_vol_map)
-
-    if col_km:
-        ajuste_vol = ajustar_volumen_m3(
-            d[col_km],
-            d["_os"],
-            ajuste_vol_por_os=d["_ajuste_vol_ruta"],
-            umbral_m3_por_os=3.0,
-            m3_estandar_por_os=0.33,
-        )
-
-        d["_volumen_original"] = ajuste_vol["volumen_original_m3"]
-        d["_volumen"] = ajuste_vol["volumen_m3"]
-        d["_m3_por_os"] = ajuste_vol["m3_por_os"]
-        d["_ajuste_vol_usado"] = ajuste_vol["ajuste_vol_usado"]
-        d["_volumen_ajustado"] = ajuste_vol["volumen_ajustado"]
-
-    else:
-        d["_volumen_original"] = 0
-        d["_volumen"] = 0
-        d["_m3_por_os"] = 0
-        d["_ajuste_vol_usado"] = d["_ajuste_vol_ruta"].fillna(0)
-        d["_volumen_ajustado"] = False
-
-    # ==========================================================
-    # Las excepciones (CSC/CNP/NHP) se VISITAN,
-    # pero NO consumen capacidad ni carga.
-    # ==========================================================
-    d.loc[d["_es_visita_sin_carga"], "_os"] = 0
-    d.loc[d["_es_visita_sin_carga"], "_kilo"] = 0
-    d.loc[d["_es_visita_sin_carga"], "_volumen_original"] = 0
-    d.loc[d["_es_visita_sin_carga"], "_volumen"] = 0
-    d.loc[d["_es_visita_sin_carga"], "_m3_por_os"] = 0
-    d.loc[d["_es_visita_sin_carga"], "_volumen_ajustado"] = False
-
-    group_cols = ["id_punto_opt", lat_col, lon_col, "ventana_inicio", "ventana_fin"]
-    opt = d.groupby(group_cols, dropna=False).agg(
-        os=("_os", "sum"),
-        volumen=("_volumen", "sum"),
-        volumen_original=("_volumen_original", "sum"),
-        kilo_mayor=("_kilo", "sum"),
-        m3_por_os_max=("_m3_por_os", "max"),
-        ajuste_vol_usado=("_ajuste_vol_usado", "max"),
-        volumen_ajustado=("_volumen_ajustado", "max"),
-        datetime_gestion=("datetime_gestion", "min"), ruta_original=("ruta", "first"), vuelta_original=("vuelta", "first")
-    ).reset_index().rename(columns={lat_col:"lat", lon_col:"lon"})
-    opt["tw_start"] = opt["ventana_inicio"].apply(lambda x: time_to_minutes(x) if pd.notna(x) else None)
-    opt["tw_end"] = opt["ventana_fin"].apply(lambda x: time_to_minutes(x) if pd.notna(x) else None)
-    # ventana obligatoria; cuando no existe, se usa todo el día para no perder demanda
-    opt["tw_start"] = opt["tw_start"].fillna(0).astype(int)
-    opt["tw_end"] = opt["tw_end"].fillna(1439).astype(int)
-    mask = opt["tw_start"] > opt["tw_end"]
-    opt.loc[mask, ["tw_start", "tw_end"]] = [0, 1439]
-
-    # Sin escalamiento: volumen y capacidad están en la misma unidad (m3).
-    opt["factor_escala_capacidad"] = 1.0
-
-    return opt.reset_index(drop=True)
-
-def construir_flotas_baseline(baseline, dicruta):
-    rutas = sorted(baseline["ruta"].dropna().unique())
-    cap_map = dicruta.set_index("ruta")["capacidad"].to_dict()
-    horario_map = dicruta.set_index("ruta")["horario_min"].to_dict() if "horario_min" in dicruta.columns else {}
-    rows = []
-    for r in rutas:
-        rows.append({"vehiculo_base": r, "capacidad": float(cap_map.get(r, DEFAULT_CAPACIDAD)), "horario_min": horario_map.get(r, np.nan)})
-    return pd.DataFrame(rows)
 
 def construir_flotas_capacidades(flota_baseline, demanda_total=0, tipos_ruta_priorizados=None):
     """
@@ -663,59 +412,6 @@ def construir_flotas_capacidades(flota_baseline, demanda_total=0, tipos_ruta_pri
 # ============================================================
 # MÉTRICAS Y MAPAS
 # ============================================================
-def metricas_baseline(baseline, dicruta, cols):
-    col_q_os, col_km, col_reserva = cols["col_q_os"], cols["col_km"], cols["col_reserva"]
-    cap_map = dicruta.set_index("ruta")["capacidad"].to_dict()
-    d = baseline.copy()
-    d["capacidad_ruta"] = d["ruta"].map(cap_map).fillna(DEFAULT_CAPACIDAD)
-    if col_km:
-        q_os_base = pd.to_numeric(d[col_q_os], errors="coerce").fillna(1) if col_q_os else pd.Series(1, index=d.index)
-        ajuste_vol = ajustar_volumen_m3(d[col_km], q_os_base, ajuste_vol_por_os=d["ruta"].map(dicruta.set_index("ruta")["ajuste_vol"].to_dict()) if "ajuste_vol" in dicruta.columns else None, umbral_m3_por_os=3.0, m3_estandar_por_os=0.33)
-        d["volumen_original_m3"] = ajuste_vol["volumen_original_m3"]
-        d["volumen_calc"] = ajuste_vol["volumen_m3"]
-        d["m3_por_os"] = ajuste_vol["m3_por_os"]
-        d["volumen_ajustado"] = ajuste_vol["volumen_ajustado"]
-    else:
-        d["volumen_original_m3"] = 0
-        d["volumen_calc"] = 0
-        d["m3_por_os"] = 0
-        d["volumen_ajustado"] = False
-    rutas = d["ruta"].nunique()
-    vueltas = d.dropna(subset=["vuelta"]).drop_duplicates(["ruta","vuelta"]).shape[0]
-    vol = d["volumen_calc"].sum()
-    tmin = (d.groupby("ruta")["datetime_gestion"].max() - d.groupby("ruta")["datetime_gestion"].min()).dt.total_seconds().fillna(0).sum()/60
-    total_os = pd.to_numeric(d[col_q_os], errors="coerce").fillna(0).sum() if col_q_os else len(d)
-    reservas = d[col_reserva].nunique() if col_reserva else len(d)
-
-    # Ocupación v8: la métrica macro es el promedio simple de la ocupación de cada vuelta ejecutada.
-    if d["vuelta"].notna().any():
-        occ_base = d.groupby(["ruta","vuelta"], dropna=False).agg(
-            volumen_vuelta=("volumen_calc", "sum"),
-            capacidad=("capacidad_ruta", "first")
-        ).reset_index()
-    else:
-        occ_base = d.groupby(["ruta"], dropna=False).agg(
-            volumen_vuelta=("volumen_calc", "sum"),
-            capacidad=("capacidad_ruta", "first")
-        ).reset_index()
-    occ_base["factor_ocupacion_vuelta"] = np.where(
-        occ_base["capacidad"] > 0,
-        occ_base["volumen_vuelta"] / occ_base["capacidad"] * 100,
-        np.nan
-    )
-    factor_macro = occ_base["factor_ocupacion_vuelta"].mean() if not occ_base.empty else np.nan
-    capacidad_total = occ_base["capacidad"].sum() if not occ_base.empty else np.nan
-
-    return {
-        "escenario":"Baseline", "cantidad_rutas":rutas, "vueltas":vueltas, "total_os":total_os, "reservas":reservas,
-        "volumen":vol, "cumplimiento_vh": d["cumple_ventana"].mean()*100 if d["cumple_ventana"].notna().any() else np.nan,
-        "excepciones": d["es_excepcion"].mean()*100 if len(d) else np.nan,
-        "productividad": total_os/rutas if rutas else np.nan,
-        "factor_ocupacion": factor_macro,
-        "ocupacion_vehiculo_dia": factor_macro,
-        "capacidad_total": capacidad_total,
-        "tiempo_ruta": tmin/rutas if rutas else np.nan,
-    }
 
 def metricas_opt(resumen, puntos, escenario, rutas_base_objetivo=None):
     """
@@ -965,6 +661,18 @@ def render_map(stops, paths, title, key_prefix="mapa"):
     if stops.empty or paths.empty:
         st.warning("No hay puntos para la selección realizada.")
         return
+
+    n_rutas_visibles = stops[ruta_col].nunique() if ruta_col in stops.columns else paths["id"].nunique()
+    n_paradas_visibles = len(stops)
+    os_visibles = pd.to_numeric(stops["os"], errors="coerce").sum() if "os" in stops.columns else None
+    vol_visible = pd.to_numeric(stops["volumen"], errors="coerce").sum() if "volumen" in stops.columns else None
+
+    stat_txt = f"🛣️ {num(n_rutas_visibles)} ruta(s)/vehículo(s) · 📍 {num(n_paradas_visibles)} parada(s)"
+    if os_visibles is not None:
+        stat_txt += f" · 📦 {num(os_visibles)} OS"
+    if vol_visible is not None:
+        stat_txt += f" · 🧊 {dec(vol_visible)} m³"
+    st.caption(stat_txt)
 
     path_layer = pdk.Layer(
         "PathLayer",
@@ -1362,13 +1070,24 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
         return int(matrix[f][t]+(service[f] if f else 0))
     transit=routing.RegisterTransitCallback(time_cb); routing.SetArcCostEvaluatorOfAllVehicles(transit)
 
-    # Prioridad suave de tipos de ruta:
-    # abrir una ruta no priorizada tiene un costo fijo adicional.
+    # Costo fijo por vehículo abierto: objetivo explícito de consolidación.
+    # Cada vehículo/vuelta que el solver activa paga este costo fijo además
+    # del tiempo de viaje. Esto empuja al solver a preferir MENOS vehículos
+    # con mayor ocupación en vez de repartir poca carga en muchas rutas,
+    # que era el comportamiento anterior (solo minimizaba tiempo de viaje).
+    for v in range(len(vehiculos)):
+        routing.SetFixedCostOfVehicle(COSTO_FIJO_VEHICULO_ABIERTO, int(v))
+
+    # Prioridad suave de tipos de ruta: abrir una ruta NO priorizada suma un
+    # costo fijo adicional por encima del costo base de consolidación.
     # Las rutas no priorizadas siguen disponibles cuando son necesarias.
     if "es_tipo_priorizado" in vehiculos.columns and vehiculos["es_tipo_priorizado"].any():
         for v,row in vehiculos.iterrows():
             if not bool(row.get("es_tipo_priorizado",False)):
-                routing.SetFixedCostOfVehicle(PENALIZACION_RUTA_NO_PRIORIZADA,int(v))
+                routing.SetFixedCostOfVehicle(
+                    COSTO_FIJO_VEHICULO_ABIERTO + PENALIZACION_RUTA_NO_PRIORIZADA,
+                    int(v)
+                )
 
     routing.AddDimension(transit,30,1440,False,"Time"); td=routing.GetDimensionOrDie("Time")
     for n,p in enumerate(puntos.to_dict("records"),1):
@@ -1728,6 +1447,99 @@ def comparar_cantidad_por_tipo_ruta(baseline, resumen_cap, dicruta):
         ["Baseline", "Optimización de capacidades", "Tipo de ruta"],
         ascending=[False, False, True]
     ).reset_index(drop=True)
+
+
+# ============================================================
+# EXPORTACIÓN PROFESIONAL A EXCEL
+# ============================================================
+def construir_resumen_ejecutivo_export(sims):
+    """Arma una fila ejecutiva por día exportado: rutas, ocupación,
+    productividad y reservas fuera, baseline vs optimización de
+    capacidades, más el motivo de bloqueo más frecuente del día.
+    """
+    filas = []
+    for fecha, sim_tmp in sims:
+        macro = sim_tmp.get("metrics", pd.DataFrame())
+        if macro is None or macro.empty:
+            continue
+        base = macro[macro["escenario"].eq("Baseline")]
+        cap = macro[macro["escenario"].eq("Optimización de capacidades")]
+        if base.empty or cap.empty:
+            continue
+        base, cap = base.iloc[0], cap.iloc[0]
+
+        no_asig = sim_tmp.get("no_asignadas_cap", pd.DataFrame())
+        motivo_top = "-"
+        if isinstance(no_asig, pd.DataFrame) and not no_asig.empty and "motivos" in no_asig.columns:
+            serie_motivos = no_asig["motivos"].astype(str).str.split("; ").explode()
+            if not serie_motivos.empty:
+                motivo_top = serie_motivos.value_counts().idxmax()
+
+        filas.append({
+            "fecha": fecha,
+            "rutas_baseline": base.get("cantidad_rutas"),
+            "rutas_optimizado": cap.get("cantidad_rutas"),
+            "rutas_menos": (base.get("cantidad_rutas", 0) or 0) - (cap.get("cantidad_rutas", 0) or 0),
+            "ocupacion_baseline_pct": base.get("factor_ocupacion"),
+            "ocupacion_optimizado_pct": cap.get("factor_ocupacion"),
+            "ocupacion_delta_pts": (cap.get("factor_ocupacion", 0) or 0) - (base.get("factor_ocupacion", 0) or 0),
+            "productividad_baseline": base.get("productividad"),
+            "productividad_optimizado": cap.get("productividad"),
+            "volumen_m3": cap.get("volumen"),
+            "reservas_no_asignadas": len(no_asig) if isinstance(no_asig, pd.DataFrame) else 0,
+            "motivo_bloqueo_mas_frecuente": motivo_top,
+        })
+    return pd.DataFrame(filas)
+
+
+def _autofit_columnas(ws, max_width=60):
+    for columna in ws.columns:
+        celdas_validas = [c for c in columna if c.value is not None]
+        if not celdas_validas:
+            continue
+        largo = max(len(str(c.value)) for c in celdas_validas)
+        letra = celdas_validas[0].column_letter
+        ws.column_dimensions[letra].width = min(max(largo + 2, 10), max_width)
+
+
+def formatear_libro_excel(workbook):
+    """Aplica formato corporativo básico a todas las hojas: encabezado en
+    negrita con fondo, panel congelado en la fila de encabezado y ancho de
+    columna ajustado al contenido. No cambia ningún dato, solo presentación.
+    El orden de las hojas ya queda correcto por el orden en que se escriben
+    (resumen_ejecutivo primero, glosario al final); esta función no reordena.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    encabezado_font = Font(bold=True, color="FFFFFF")
+    encabezado_fill = PatternFill("solid", fgColor="1D2939")
+
+    for ws in workbook.worksheets:
+        if ws.max_row == 0 or ws.max_column == 0:
+            continue
+        for celda in ws[1]:
+            celda.font = encabezado_font
+            celda.fill = encabezado_fill
+            celda.alignment = Alignment(vertical="center")
+        ws.freeze_panes = "A2"
+        _autofit_columnas(ws)
+
+
+GLOSARIO_EXPORT = [
+    {"Hoja": "resumen_ejecutivo", "Descripción": "Una fila por día exportado: rutas, ocupación y productividad baseline vs. optimización de capacidades, y el motivo de bloqueo más frecuente."},
+    {"Hoja": "macro_escenarios", "Descripción": "Métricas macro completas por día y escenario (Baseline / Optimización de capacidades)."},
+    {"Hoja": "comparacion_tipos_ruta", "Descripción": "Cantidad de rutas físicas únicas por tipo de ruta, Baseline vs. Optimización de capacidades."},
+    {"Hoja": "baseline_detalle", "Descripción": "Detalle de gestiones (una fila por evento) de la operación real del día."},
+    {"Hoja": "baseline_resumen_ruta", "Descripción": "Resumen operacional agregado por ruta física en el Baseline."},
+    {"Hoja": "baseline_resumen_vuelta", "Descripción": "Resumen operacional agregado por ruta y vuelta (AM/PM) en el Baseline."},
+    {"Hoja": "baseline_diagnostico", "Descripción": "Hallazgos de calidad de datos detectados en el Baseline (ventanas horarias, geocodificación, etc.)."},
+    {"Hoja": "opt_cap_resumen", "Descripción": "Resumen por vehículo/vuelta generado por el optimizador de capacidades."},
+    {"Hoja": "opt_cap_detalle", "Descripción": "Detalle parada por parada de cada ruta generada por el optimizador de capacidades."},
+    {"Hoja": "demanda_optimizable", "Descripción": "Puntos de demanda (reservas agrupadas) que se entregaron al optimizador."},
+    {"Hoja": "reservas_no_asignadas", "Descripción": "Reservas que el optimizador no pudo asignar a ninguna ruta, con el o los motivos (restricción incumplida)."},
+    {"Hoja": "validaciones_dicruta", "Descripción": "Filas del diccionario de rutas con configuración inválida o inconsistente detectada al cargar el archivo."},
+    {"Hoja": "dicruta_configuracion", "Descripción": "Copia del diccionario de rutas/capacidad utilizado en esta corrida, tal como fue interpretado por la app."},
+]
 
 
 # ============================================================
@@ -2131,6 +1943,83 @@ with tab_macro:
     else:
         st.success("Escenarios generados correctamente.")
 
+    # ==========================================================
+    # RESUMEN EJECUTIVO
+    # Responde en una sola vista las preguntas que la operación
+    # necesita resolver rápido: qué mejoró, cuánto, y qué lo frenó.
+    # ==========================================================
+    st.markdown('<div class="section-title">Resumen ejecutivo</div>', unsafe_allow_html=True)
+
+    _macro_exec = sim["metrics"].copy()
+    _base_exec = _macro_exec[_macro_exec["escenario"].eq("Baseline")].iloc[0]
+    _cap_exec = _macro_exec[_macro_exec["escenario"].eq("Optimización de capacidades")].iloc[0]
+
+    _delta_rutas = float(_cap_exec["cantidad_rutas"]) - float(_base_exec["cantidad_rutas"])
+    _delta_ocupacion = float(_cap_exec["factor_ocupacion"]) - float(_base_exec["factor_ocupacion"])
+    _no_asignadas_df = sim.get("no_asignadas_cap", pd.DataFrame())
+    _n_no_asignadas = len(_no_asignadas_df)
+
+    if _delta_rutas < 0 and _delta_ocupacion >= 0:
+        _veredicto = f"✅ La optimización de capacidades usa **{abs(_delta_rutas):.0f} ruta(s) menos** y sube la ocupación **{_delta_ocupacion:+.1f} pts**, sobre el mismo volumen operado."
+    elif _delta_rutas < 0:
+        _veredicto = f"✅ La optimización de capacidades usa **{abs(_delta_rutas):.0f} ruta(s) menos**, aunque la ocupación promedio varió {_delta_ocupacion:+.1f} pts."
+    elif _delta_rutas == 0 and _delta_ocupacion > 0:
+        _veredicto = f"✅ Con la misma cantidad de rutas, la ocupación promedio sube **{_delta_ocupacion:+.1f} pts** (menos capacidad ociosa)."
+    else:
+        _veredicto = "ℹ️ Con la demanda y restricciones de este día, el baseline ya está cerca del óptimo alcanzable; revisa las restricciones que limitaron más mejora abajo."
+
+    st.markdown(f"""
+<div class="day-card" style="background:#F0FDF4;border-color:#BBF7D0;">
+  <div class="day-card-title">¿Qué mejoró hoy?</div>
+  <div style="font-size:1.05rem;color:#101828;margin-top:.3rem;">{_veredicto}</div>
+</div>
+""", unsafe_allow_html=True)
+
+    _delta_productividad = float(_cap_exec["productividad"]) - float(_base_exec["productividad"])
+
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric(
+        "Rutas: baseline → optimizado",
+        f"{num(_base_exec['cantidad_rutas'])} → {num(_cap_exec['cantidad_rutas'])}",
+        delta=f"{_delta_rutas:+.0f} rutas",
+        delta_color="inverse"
+    )
+    e2.metric(
+        "Ocupación: baseline → optimizado",
+        f"{pct(_base_exec['factor_ocupacion'])} → {pct(_cap_exec['factor_ocupacion'])}",
+        delta=f"{_delta_ocupacion:+.1f} pts"
+    )
+    e3.metric(
+        "Productividad: baseline → optimizado",
+        f"{dec(_base_exec['productividad'])} → {dec(_cap_exec['productividad'])}",
+        delta=f"{_delta_productividad:+.1f}"
+    )
+    e4.metric(
+        "Reservas que quedaron fuera",
+        num(_n_no_asignadas),
+        delta=None if _n_no_asignadas == 0 else f"{_n_no_asignadas} sin asignar",
+        delta_color="inverse"
+    )
+
+    with st.expander("¿Qué restricciones impidieron mejorar aún más?", expanded=_n_no_asignadas > 0):
+        if _no_asignadas_df.empty:
+            st.success("No hubo reservas bloqueadas por restricciones: toda la demanda optimizable fue asignada.")
+        else:
+            _motivos_exp = (
+                _no_asignadas_df["motivos"]
+                .astype(str)
+                .str.split("; ")
+                .explode()
+                .value_counts()
+                .reset_index()
+            )
+            _motivos_exp.columns = ["Restricción / motivo", "Reservas afectadas"]
+            st.caption(
+                f"{_n_no_asignadas} reserva(s) quedaron fuera de la optimización de capacidades. "
+                "Estos son los motivos más frecuentes (una reserva puede tener más de un motivo):"
+            )
+            st.dataframe(_motivos_exp, use_container_width=True, hide_index=True)
+
     d1, d2 = st.columns(2)
     d1.metric(
         "Reservas no asignadas",
@@ -2181,23 +2070,6 @@ with tab_macro:
     st.markdown("#### Tabla detalle")
     st.dataframe(macro[cols_show].style.format(fmt, na_rep="-"), use_container_width=True, hide_index=True)
 
-    b, c = macro.iloc[0], macro.iloc[1]
-    k1, k2, k3 = st.columns(3)
-    k1.metric(
-        "Rutas baseline",
-        num(b["cantidad_rutas"])
-    )
-    k2.metric(
-        "Rutas opt. capacidades",
-        num(c["cantidad_rutas"]),
-        delta=num(
-            c["cantidad_rutas"] - b["cantidad_rutas"]
-        )
-    )
-    k3.metric(
-        "OS del día",
-        num(b["total_os"])
-    )
     st.caption("Baseline muestra el contexto completo. La optimización de capacidades muestra demanda PU optimizable; por eso reservas/OS pueden bajar si había excepciones o puntos sin coordenadas.")
 
     st.markdown("#### Comparación de cantidad por tipo de ruta")
@@ -2273,10 +2145,11 @@ with tab_rutas:
         )
         st.stop()
 
-    sub1, sub2, sub3 = st.tabs([
+    sub1, sub2, sub3, sub4 = st.tabs([
         "Baseline",
         "Optimización de capacidades",
-        "Tablas"
+        "Tablas",
+        "Ranking de ocupación"
     ])
 
     with sub1:
@@ -2408,6 +2281,60 @@ with tab_rutas:
                 use_container_width=True
             )
 
+    with sub4:
+        st.markdown("#### ¿Qué rutas están mejor y peor utilizadas?")
+        st.caption(
+            "Ordenado por % de ocupación. Las rutas al final de cada lista son las que más "
+            "capacidad ociosa dejan en el día — primeras candidatas a consolidar o eliminar."
+        )
+
+        rank_bl = resumen_por_ruta_baseline(sim["baseline"], dicruta, cols)[
+            ["ruta", "volumen", "capacidad", "factor_ocupacion", "vueltas", "reservas"]
+        ].dropna(subset=["factor_ocupacion"]).sort_values("factor_ocupacion", ascending=False)
+
+        rank_cap = sim["resumen_cap_opt"].copy()
+        if not rank_cap.empty and "factor_ocupacion" in rank_cap.columns:
+            rank_cap = rank_cap[
+                ["vehiculo_base", "bloque", "vuelta", "volumen", "capacidad", "factor_ocupacion", "paradas"]
+            ].dropna(subset=["factor_ocupacion"]).sort_values("factor_ocupacion", ascending=False)
+
+        rk1, rk2 = st.columns(2)
+        with rk1:
+            st.markdown("##### Baseline")
+            if rank_bl.empty:
+                st.info("Sin datos de ocupación por ruta para este día.")
+            else:
+                st.caption(f"🟢 Mejor ocupadas ({min(3, len(rank_bl))})")
+                st.dataframe(rank_bl.head(3), use_container_width=True, hide_index=True)
+                st.caption(f"🔴 Con más capacidad ociosa ({min(3, len(rank_bl))})")
+                st.dataframe(rank_bl.tail(3).sort_values("factor_ocupacion"), use_container_width=True, hide_index=True)
+
+                chart_bl = alt.Chart(rank_bl).mark_bar().encode(
+                    x=alt.X("factor_ocupacion:Q", title="% Ocupación"),
+                    y=alt.Y("ruta:N", sort="-x", title="Ruta"),
+                    color=alt.condition("datum.factor_ocupacion < 30", alt.value("#F04438"), alt.value("#12B76A")),
+                    tooltip=["ruta:N", alt.Tooltip("factor_ocupacion:Q", format=".1f"), alt.Tooltip("volumen:Q", format=".2f")]
+                ).properties(height=max(200, 22 * len(rank_bl)))
+                st.altair_chart(chart_bl, use_container_width=True)
+
+        with rk2:
+            st.markdown("##### Optimización de capacidades")
+            if rank_cap.empty:
+                st.info("Sin datos de ocupación por vehículo para este día.")
+            else:
+                st.caption(f"🟢 Mejor ocupadas ({min(3, len(rank_cap))})")
+                st.dataframe(rank_cap.head(3), use_container_width=True, hide_index=True)
+                st.caption(f"🔴 Con más capacidad ociosa ({min(3, len(rank_cap))})")
+                st.dataframe(rank_cap.tail(3).sort_values("factor_ocupacion"), use_container_width=True, hide_index=True)
+
+                chart_cap = alt.Chart(rank_cap).mark_bar().encode(
+                    x=alt.X("factor_ocupacion:Q", title="% Ocupación"),
+                    y=alt.Y("vehiculo_base:N", sort="-x", title="Vehículo / ruta"),
+                    color=alt.condition("datum.factor_ocupacion < 30", alt.value("#F04438"), alt.value("#12B76A")),
+                    tooltip=["vehiculo_base:N", "bloque:N", alt.Tooltip("factor_ocupacion:Q", format=".1f"), alt.Tooltip("volumen:Q", format=".2f")]
+                ).properties(height=max(200, 22 * len(rank_cap)))
+                st.altair_chart(chart_cap, use_container_width=True)
+
 with tab_exportar:
     st.markdown('<div class="section-title">Exportar</div>', unsafe_allow_html=True)
     st.caption("Ahora puedes descargar uno o varios días, no solo el día que estás viendo en pantalla.")
@@ -2458,20 +2385,26 @@ with tab_exportar:
                 all_diag_bl.append(sim_tmp.get("diagnostico_baseline", pd.DataFrame()).assign(fecha_export=f))
                 all_tipos_ruta.append(sim_tmp.get("comparacion_tipos_ruta", pd.DataFrame()).assign(fecha_export=f))
 
+            resumen_ejecutivo_export = construir_resumen_ejecutivo_export(sims)
+
             output_buffer = BytesIO()
             with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
+                resumen_ejecutivo_export.to_excel(writer, sheet_name="resumen_ejecutivo", index=False)
                 concatenar_no_vacios(all_metrics).to_excel(writer, sheet_name="macro_escenarios", index=False)
+                concatenar_no_vacios(all_tipos_ruta).to_excel(writer, sheet_name="comparacion_tipos_ruta", index=False)
                 concatenar_no_vacios(all_baseline).to_excel(writer, sheet_name="baseline_detalle", index=False)
                 concatenar_no_vacios(all_bl_ruta).to_excel(writer, sheet_name="baseline_resumen_ruta", index=False)
                 concatenar_no_vacios(all_bl_vuelta).to_excel(writer, sheet_name="baseline_resumen_vuelta", index=False)
+                concatenar_no_vacios(all_diag_bl).to_excel(writer, sheet_name="baseline_diagnostico", index=False)
                 concatenar_no_vacios(all_opt_cap_res).to_excel(writer, sheet_name="opt_cap_resumen", index=False)
                 concatenar_no_vacios(all_opt_cap_det).to_excel(writer, sheet_name="opt_cap_detalle", index=False)
                 concatenar_no_vacios(all_puntos).to_excel(writer, sheet_name="demanda_optimizable", index=False)
                 concatenar_no_vacios(all_no_asig).to_excel(writer, sheet_name="reservas_no_asignadas", index=False)
-                concatenar_no_vacios(all_diag_bl).to_excel(writer, sheet_name="baseline_diagnostico", index=False)
-                concatenar_no_vacios(all_tipos_ruta).to_excel(writer, sheet_name="comparacion_tipos_ruta", index=False)
                 pd.DataFrame(DICRUTA_VALIDACIONES).to_excel(writer, sheet_name="validaciones_dicruta", index=False)
                 dicruta.to_excel(writer, sheet_name="dicruta_configuracion", index=False)
+                pd.DataFrame(GLOSARIO_EXPORT).to_excel(writer, sheet_name="glosario", index=False)
+
+                formatear_libro_excel(writer.book)
 
             output_buffer.seek(0)
             st.download_button(
