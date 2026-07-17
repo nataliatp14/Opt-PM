@@ -41,7 +41,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-title">Baseline Operacional + Optimizador PM</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Comparación automática: Baseline vs Optimización de ruta vs Optimización de capacidades</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Comparación automática: Baseline vs Optimización de capacidades</div>', unsafe_allow_html=True)
 
 
 HUB_LAT = -33.43291
@@ -70,6 +70,7 @@ OSRM_MATRIX_TIMEOUT_SECONDS = int(os.getenv("OSRM_MATRIX_TIMEOUT_SECONDS", "20")
 OSRM_ROUTE_TIMEOUT_SECONDS = int(os.getenv("OSRM_ROUTE_TIMEOUT_SECONDS", "12"))
 OSRM_MAX_MATRIX_POINTS = int(os.getenv("OSRM_MAX_MATRIX_POINTS", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
+PENALIZACION_RUTA_NO_PRIORIZADA = int(os.getenv("PENALIZACION_RUTA_NO_PRIORIZADA", "5000"))
 DISABLE_OSRM = os.getenv("DISABLE_OSRM", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
 
 
@@ -606,24 +607,56 @@ def construir_flotas_baseline(baseline, dicruta):
         rows.append({"vehiculo_base": r, "capacidad": float(cap_map.get(r, DEFAULT_CAPACIDAD)), "horario_min": horario_map.get(r, np.nan)})
     return pd.DataFrame(rows)
 
-def construir_flotas_capacidades(flota_baseline, demanda_total=0):
+def construir_flotas_capacidades(flota_baseline, demanda_total=0, tipos_ruta_priorizados=None):
     """
-    Optimización de capacidades v9.
+    Optimización de capacidades.
 
-    Regla operacional corregida:
-    - NO usa todo el diccionario de rutas.
-    - NO trae camiones/rutas que no participaron en el día.
     - Usa el mismo universo de vehículos/rutas del baseline del día y permite usar menos.
-    - Prioriza los vehículos de mayor capacidad DENTRO de la flota usada ese día.
-
-    Esto evita que el escenario active vehículos gigantes del diccionario y baje
-    artificialmente el factor de ocupación.
+    - Respeta todas las restricciones operacionales.
+    - Cuando se seleccionan tipos de ruta prioritarios, intenta asignarles carga primero.
+    - La prioridad es suave: si esas rutas no son suficientes o compatibles, usa el resto.
     """
+    tipos_ruta_priorizados = {
+        str(x).strip().upper()
+        for x in (tipos_ruta_priorizados or [])
+    }
+
     flota = flota_baseline.copy()
     if flota.empty:
-        flota = pd.DataFrame([{"vehiculo_base": f"CAP-{i+1}", "capacidad": DEFAULT_CAPACIDAD} for i in range(max(1, math.ceil(demanda_total/DEFAULT_CAPACIDAD)))])
-    flota["capacidad"] = pd.to_numeric(flota["capacidad"], errors="coerce").fillna(DEFAULT_CAPACIDAD)
-    return flota.sort_values(["capacidad", "vehiculo_base"], ascending=[False, True]).reset_index(drop=True)
+        flota = pd.DataFrame([
+            {
+                "vehiculo_base": f"CAP-{i+1}",
+                "capacidad": DEFAULT_CAPACIDAD,
+                "tipo_ruta": "SIN INFORMACIÓN"
+            }
+            for i in range(max(1, math.ceil(demanda_total/DEFAULT_CAPACIDAD)))
+        ])
+
+    flota["capacidad"] = pd.to_numeric(
+        flota["capacidad"],
+        errors="coerce"
+    ).fillna(DEFAULT_CAPACIDAD)
+
+    if "tipo_ruta" not in flota.columns:
+        flota["tipo_ruta"] = "SIN INFORMACIÓN"
+
+    flota["tipo_ruta_norm"] = (
+        flota["tipo_ruta"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    flota["es_tipo_priorizado"] = (
+        flota["tipo_ruta_norm"].isin(tipos_ruta_priorizados)
+        if tipos_ruta_priorizados
+        else False
+    )
+
+    return flota.sort_values(
+        ["es_tipo_priorizado", "capacidad", "vehiculo_base"],
+        ascending=[False, False, True]
+    ).reset_index(drop=True)
 
 # El motor de optimización se define en la sección V18 antes de la interfaz.
 
@@ -1263,7 +1296,22 @@ def construir_flotas_baseline(baseline,dicruta):
     rows=[]
     for r in rutas:
         x=cfg.get(r,{})
-        rows.append({"vehiculo_base":r,"capacidad":float(x.get("capacidad",DEFAULT_CAPACIDAD) if pd.notna(x.get("capacidad",np.nan)) else DEFAULT_CAPACIDAD),"horario_min":x.get("hora_min_minutos",np.nan),"hora_min_minutos":x.get("hora_min_minutos",np.nan),"hora_max_minutos":x.get("hora_max_minutos",np.nan),"vol_min":x.get("vol_min",np.nan),"vol_max":x.get("vol_max",np.nan),"resv_max":x.get("resv_max",np.nan),"bt":x.get("bt",np.nan),"ajuste_vol":x.get("ajuste_vol",np.nan),"es_propio":bool(x.get("es_propio",False)),"config_valida":bool(x.get("config_valida",True))})
+        rows.append({
+            "vehiculo_base":r,
+            "capacidad":float(x.get("capacidad",DEFAULT_CAPACIDAD) if pd.notna(x.get("capacidad",np.nan)) else DEFAULT_CAPACIDAD),
+            "tipo_ruta":str(x.get("tipo_ruta","SIN INFORMACIÓN")),
+            "tipo_flota":str(x.get("tipo_flota","SIN INFORMACIÓN")),
+            "horario_min":x.get("hora_min_minutos",np.nan),
+            "hora_min_minutos":x.get("hora_min_minutos",np.nan),
+            "hora_max_minutos":x.get("hora_max_minutos",np.nan),
+            "vol_min":x.get("vol_min",np.nan),
+            "vol_max":x.get("vol_max",np.nan),
+            "resv_max":x.get("resv_max",np.nan),
+            "bt":x.get("bt",np.nan),
+            "ajuste_vol":x.get("ajuste_vol",np.nan),
+            "es_propio":bool(x.get("es_propio",False)),
+            "config_valida":bool(x.get("config_valida",True))
+        })
     return pd.DataFrame(rows)
 
 
@@ -1313,6 +1361,15 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
         f=manager.IndexToNode(fi); t=manager.IndexToNode(ti)
         return int(matrix[f][t]+(service[f] if f else 0))
     transit=routing.RegisterTransitCallback(time_cb); routing.SetArcCostEvaluatorOfAllVehicles(transit)
+
+    # Prioridad suave de tipos de ruta:
+    # abrir una ruta no priorizada tiene un costo fijo adicional.
+    # Las rutas no priorizadas siguen disponibles cuando son necesarias.
+    if "es_tipo_priorizado" in vehiculos.columns and vehiculos["es_tipo_priorizado"].any():
+        for v,row in vehiculos.iterrows():
+            if not bool(row.get("es_tipo_priorizado",False)):
+                routing.SetFixedCostOfVehicle(PENALIZACION_RUTA_NO_PRIORIZADA,int(v))
+
     routing.AddDimension(transit,30,1440,False,"Time"); td=routing.GetDimensionOrDie("Time")
     for n,p in enumerate(puntos.to_dict("records"),1):
         td.CumulVar(manager.NodeToIndex(n)).SetRange(int(p["tw_start"]),int(p["tw_end"]))
@@ -1413,37 +1470,6 @@ def optimizar_cached(puntos,flota,escenario,usar_osrm_matrix=True,usar_osrm_geom
     return routes,pd.DataFrame(details),resumen,meta
 
 
-def optimizar_ruta_preservando_flota(puntos,flota_baseline,usar_osrm_geometry=True):
-    scenario="Optimización de ruta"; routes=[]; details=[]; resumen=[]; incompat=[]; rid=1
-    if flota_baseline.empty: return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_flota","modelo":"ruta_preservada_v18","incompatibles":pd.DataFrame()}
-    cfg=flota_baseline.set_index("vehiculo_base").to_dict("index")
-    def travel(a,b): return int(math.ceil(haversine_km(a[0],a[1],b[0],b[1])*1.35/28*60))
-    for veh,grp in puntos.groupby("ruta_original"):
-        v=cfg.get(str(veh))
-        if v is None:
-            for p in grp.to_dict("records"): incompat.append(_diagnosticar_no_asignada(p,pd.DataFrame()))
-            continue
-        for bloque,vuelta,bstart,bend in [("AM",1,BLOQUE_AM_START_MIN,BLOQUE_AM_END_MIN),("PM",2,BLOQUE_PM_START_MIN,BLOQUE_PM_END_MIN)]:
-            g=grp[grp["tw_end"].le(HORA_CORTE_HUB_MIN) if bloque=="AM" else grp["tw_end"].gt(HORA_CORTE_HUB_MIN)].copy()
-            if g.empty: continue
-            hmin=int(v["hora_min_minutos"]) if pd.notna(v.get("hora_min_minutos",np.nan)) else None; hmax=int(v["hora_max_minutos"]) if pd.notna(v.get("hora_max_minutos",np.nan)) else None
-            s=max(bstart,hmin) if hmin is not None else bstart; e=min(bend,hmax) if hmax is not None else bend
-            cap=float(v["capacidad"]); cupo=float(v["resv_max"]) if pd.notna(v.get("resv_max",np.nan)) else math.inf; t=s; pos=HUB_COORD; coords=[HUB_COORD]; out=[]; total_vol=total_os=total_k=0; ruta_factible=True
-            for seq,p in enumerate(g.sort_values(["tw_end","tw_start"]).to_dict("records"),1):
-                eta=max(t+travel(pos,(p["lat"],p["lon"])),p["tw_start"]); serv=int(math.ceil(TIEMPO_SERVICIO_BASE+p["os"]*TIEMPO_SERVICIO_OS)); fin=eta+serv+travel((p["lat"],p["lon"]),HUB_COORD)
-                ev=evaluar_compatibilidad_reserva_ruta(p,v,cap,cupo,eta,fin)
-                if s>=e: ev["motivos"].append("bloque AM/PM incompatible con la configuración horaria"); ev["compatible"]=False
-                if fin>e: ev["motivos"].append("incompatibilidad horaria: excede bloque operativo"); ev["compatible"]=False
-                if fin-s>TIEMPO_MAX_RUTA_MIN: ev["motivos"].append("supera duración máxima de ruta"); ev["compatible"]=False
-                ruta_factible &= ev["compatible"]
-                if not ev["compatible"]: incompat.append({"reserva":p["id_punto_opt"],"ruta_original":veh,"volumen":p["volumen"],"q_os":p["os"],"q_os_B":p.get("q_os_B",0),"ventana_horaria":f"{minutes_to_time(p['tw_start'])}-{minutes_to_time(p['tw_end'])}","motivos":"; ".join(sorted(set(ev["motivos"]))),"rutas_evaluadas":veh,"cantidad_rutas_compatibles_encontradas":0})
-                row={"escenario":scenario,"id_ruta_optimizada":rid,"vehiculo_base":veh,"vuelta":vuelta,"bloque":bloque,"secuencia":seq,"id_punto_opt":p["id_punto_opt"],"reserva":p["id_punto_opt"],"lat":p["lat"],"lon":p["lon"],"eta":minutes_to_time(eta),"eta_min":eta,"tw_start":p["tw_start"],"tw_end":p["tw_end"],"cumple_vh_estimado":eta<=p["tw_end"],"compatible":ev["compatible"],"motivos_incompatibilidad":"; ".join(ev["motivos"]),"os":p["os"],"q_os_B":p.get("q_os_B",0),"volumen":p["volumen"],"volumen_original":p["volumen_original"],"kilo_mayor":p["kilo_mayor"],"m3_por_os_max":p.get("m3_por_os_max",0),"ajuste_vol_usado":p.get("ajuste_vol_usado",0.33),"volumen_ajustado":p.get("volumen_ajustado",False),"ruta_real_original":veh,"vuelta_real_original":p["vuelta_original"]}
-                out.append(row); details.append(row); coords.append((p["lat"],p["lon"])); total_vol+=p["volumen"]; total_os+=p["os"]; total_k+=p["kilo_mayor"]; cap-=p["volumen"]; cupo-=1; t=eta+serv; pos=(p["lat"],p["lon"])
-            coords.append(HUB_COORD); fin=t+travel(pos,HUB_COORD); geom,ok,km=get_route_geometry(tuple(coords),usar_osrm=usar_osrm_geometry)
-            route={"escenario":scenario,"id_ruta_optimizada":rid,"vehiculo_base":veh,"vuelta":vuelta,"bloque":bloque,"capacidad":v["capacidad"],"factor_ocupacion":total_vol/v["capacidad"]*100,"color":color_from_text(f"{scenario}-{veh}-{vuelta}"),"geometry":geom,"geometry_ok":ok,"stops":out,"total_os":total_os,"volumen":total_vol,"kilo_mayor":total_k,"paradas":len(out),"km_estimado":km,"inicio_ruta":minutes_to_time(s),"fin_ruta":minutes_to_time(fin),"tiempo_ruta_min":fin-s,"activo":True,"factible":ruta_factible,"motivos_incompatibilidad":"" if ruta_factible else "Revisar detalle de reservas incompatibles"}
-            routes.append(route); resumen.append({k:v for k,v in route.items() if k not in ["geometry","stops","color"]}); rid+=1
-    return routes,pd.DataFrame(details),pd.DataFrame(resumen),{"status":"ok_ruta_preservada" if not incompat else "ok_ruta_preservada_con_incompatibilidades","modelo":"ruta_preservada_v18","incompatibles":pd.DataFrame(incompat),"reservas_incompatibles":len(incompat)}
-
 
 def _diagnostico_baseline(baseline,dicruta,cols):
     pts=preparar_puntos(baseline,cols,dicruta=dicruta); cfg=dicruta.set_index("ruta").to_dict("index"); rows=[]
@@ -1502,6 +1528,35 @@ except Exception as e:
     st.stop()
 
 
+# Preferencia opcional de tipos de ruta para la optimización de capacidades.
+tipos_ruta_dic = sorted([
+    str(x).strip()
+    for x in dicruta.get("tipo_ruta", pd.Series(dtype=str)).dropna().unique()
+    if str(x).strip() and str(x).strip().upper() != "SIN INFORMACIÓN"
+])
+
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("Prioridad de rutas")
+    tipos_ruta_priorizados = st.multiselect(
+        "Tipos de ruta a priorizar",
+        options=tipos_ruta_dic,
+        default=[],
+        help=(
+            "El optimizador intentará asignar carga primero a estos tipos de ruta, "
+            "siempre que cumplan capacidad, volumen, BT, cupos y horarios. "
+            "Si no son suficientes, utilizará los demás tipos disponibles."
+        ),
+        key="tipos_ruta_priorizados"
+    )
+    if tipos_ruta_priorizados:
+        st.caption(
+            "Prioridad activa: " + ", ".join(tipos_ruta_priorizados)
+        )
+    else:
+        st.caption("Sin prioridad: se mantiene la lógica normal por capacidad y tiempo.")
+
+
 # Configuración y validaciones del diccionario v18
 with st.expander("⚙️ Configuración de rutas cargada", expanded=False):
     cfg_show = dicruta[["ruta","capacidad","horario_txt","vol_min","vol_max","resv_max","bt","ajuste_vol","es_propio","config_valida"]].copy()
@@ -1523,51 +1578,6 @@ tipos_disponibles = sorted(peu["tipo_ruta"].dropna().unique())
 default_clases = clases_disponibles
 comunas_disponibles = sorted(peu["comuna"].dropna().unique())
 default_comuna = "Todas"
-
-
-def completar_resumen_ruta_con_flota(resumen, flota_baseline, escenario="Optimización de ruta"):
-    """
-    v10: En Optimización de ruta se mantiene la flota física del baseline.
-    El resumen exportado debe mostrar también los vehículos sin carga, para que
-    el conteo del reporte calce con la métrica de Streamlit y para que la
-    ocupación promedio no excluya rutas vacías.
-    """
-    resumen = resumen.copy() if resumen is not None else pd.DataFrame()
-    if flota_baseline is None or flota_baseline.empty:
-        return resumen
-
-    usados = set(resumen["vehiculo_base"].astype(str)) if (not resumen.empty and "vehiculo_base" in resumen.columns) else set()
-    rows = []
-    next_id = int(pd.to_numeric(resumen.get("id_ruta_optimizada", pd.Series(dtype=float)), errors="coerce").max() or 0) + 1
-    for _, r in flota_baseline.iterrows():
-        veh = str(r["vehiculo_base"])
-        if veh in usados:
-            continue
-        rows.append({
-            "escenario": escenario,
-            "id_ruta_optimizada": next_id,
-            "vehiculo_base": veh,
-            "vuelta": 0,
-            "bloque": "SIN_ASIGNACION",
-            "capacidad": float(r.get("capacidad", DEFAULT_CAPACIDAD)),
-            "factor_ocupacion": 0.0,
-            "geometry_ok": False,
-            "total_os": 0.0,
-            "volumen": 0.0,
-            "kilo_mayor": 0.0,
-            "paradas": 0,
-            "km_estimado": 0.0,
-            "inicio_ruta": "-",
-            "fin_ruta": "-",
-            "tiempo_ruta_min": 0.0,
-            "activo": False
-        })
-        next_id += 1
-    if rows:
-        resumen = pd.concat([resumen, pd.DataFrame(rows)], ignore_index=True, sort=False)
-    if "activo" not in resumen.columns:
-        resumen["activo"] = resumen.get("paradas", 0).fillna(0).astype(float) > 0
-    return resumen
 
 
 
@@ -1656,6 +1666,70 @@ def construir_configuracion_propios(df_operacion, dicruta, key_prefix="propios_g
         "vehiculos_propios_incluidos": vehiculos_incluidos
     }
 
+def comparar_cantidad_por_tipo_ruta(baseline, resumen_cap, dicruta):
+    """Compara rutas físicas únicas por tipo entre Baseline y Capacidades."""
+    tipo_map = (
+        dicruta.set_index("ruta")["tipo_ruta"].to_dict()
+        if "tipo_ruta" in dicruta.columns
+        else {}
+    )
+
+    # Baseline: una ruta física se cuenta una sola vez, aunque tenga varias vueltas.
+    base_rutas = baseline[["ruta"]].dropna().drop_duplicates().copy()
+    base_rutas["tipo_ruta"] = (
+        base_rutas["ruta"]
+        .map(tipo_map)
+        .fillna("SIN INFORMACIÓN")
+        .astype(str)
+        .str.strip()
+    )
+    base_count = (
+        base_rutas.groupby("tipo_ruta")["ruta"]
+        .nunique()
+        .rename("Baseline")
+    )
+
+    # Optimización: solo vehículos/rutas efectivamente activados.
+    if resumen_cap is None or resumen_cap.empty:
+        opt_count = pd.Series(dtype=float, name="Optimización de capacidades")
+    else:
+        opt = resumen_cap.copy()
+        if "activo" in opt.columns:
+            opt = opt[opt["activo"].fillna(True).astype(bool)].copy()
+        elif "paradas" in opt.columns:
+            opt = opt[
+                pd.to_numeric(opt["paradas"], errors="coerce").fillna(0) > 0
+            ].copy()
+
+        opt = opt[["vehiculo_base"]].dropna().drop_duplicates().copy()
+        opt["tipo_ruta"] = (
+            opt["vehiculo_base"]
+            .map(tipo_map)
+            .fillna("SIN INFORMACIÓN")
+            .astype(str)
+            .str.strip()
+        )
+        opt_count = (
+            opt.groupby("tipo_ruta")["vehiculo_base"]
+            .nunique()
+            .rename("Optimización de capacidades")
+        )
+
+    comparacion = pd.concat([base_count, opt_count], axis=1).fillna(0).reset_index()
+    comparacion["Baseline"] = comparacion["Baseline"].astype(int)
+    comparacion["Optimización de capacidades"] = (
+        comparacion["Optimización de capacidades"].astype(int)
+    )
+    comparacion["Variación"] = (
+        comparacion["Optimización de capacidades"] - comparacion["Baseline"]
+    )
+    comparacion = comparacion.rename(columns={"tipo_ruta": "Tipo de ruta"})
+    return comparacion.sort_values(
+        ["Baseline", "Optimización de capacidades", "Tipo de ruta"],
+        ascending=[False, False, True]
+    ).reset_index(drop=True)
+
+
 # ============================================================
 # EJECUCIÓN AUTOMÁTICA DE ESCENARIOS
 # ============================================================
@@ -1665,114 +1739,219 @@ def ejecutar_escenarios_dia(
     tipos_sel,
     comuna_sel=None,
     optimizar_reservas_propias=False,
-    vehiculos_propios_incluidos=None
+    vehiculos_propios_incluidos=None,
+    tipos_ruta_priorizados=None
 ):
-    """Ejecuta baseline, optimización de ruta y optimización de capacidades.
+    """Ejecuta baseline y optimización de capacidades.
 
     Reglas para rutas propias:
     - El baseline siempre conserva toda la operación real.
-    - Si optimizar_reservas_propias=False, sus reservas se excluyen de ambos escenarios optimizados.
+    - Si optimizar_reservas_propias=False, sus reservas se excluyen de la optimización.
     - En capacidades, sólo los vehículos propios seleccionados quedan disponibles como flota.
-    - En optimización de ruta, una reserva propia sólo se mantiene si también fue habilitado su vehículo,
-      porque ese escenario preserva la asociación reserva-ruta original.
     """
     vehiculos_propios_incluidos = vehiculos_propios_incluidos or []
+    tipos_ruta_priorizados = tipos_ruta_priorizados or []
 
-    base = peu[(peu["fecha_operacion"] == fecha) & peu["clase_ruta"].isin(clases_sel) & peu["tipo_ruta"].isin(tipos_sel)].copy()
+    base = peu[
+        (peu["fecha_operacion"] == fecha) &
+        peu["clase_ruta"].isin(clases_sel) &
+        peu["tipo_ruta"].isin(tipos_sel)
+    ].copy()
+
     if comuna_sel and comuna_sel != "Todas":
         base = base[base["comuna"].eq(comuna_sel)].copy()
 
-    acc = accesos[accesos["solo_fch"] == fecha].sort_values(["ruta", "datetime_ingreso"]).copy()
+    acc = accesos[
+        accesos["solo_fch"] == fecha
+    ].sort_values(["ruta", "datetime_ingreso"]).copy()
+
     baseline_completo = asignar_vueltas_por_cierre(base, acc)
 
-    propio_map = dicruta.set_index("ruta")["es_propio"].to_dict() if "es_propio" in dicruta.columns else {}
-    baseline_completo["es_ruta_propia"] = baseline_completo["ruta"].map(propio_map).fillna(False).astype(bool)
-    rutas_propias_dia = sorted(baseline_completo.loc[baseline_completo["es_ruta_propia"], "ruta"].dropna().unique())
+    propio_map = (
+        dicruta.set_index("ruta")["es_propio"].to_dict()
+        if "es_propio" in dicruta.columns
+        else {}
+    )
+
+    baseline_completo["es_ruta_propia"] = (
+        baseline_completo["ruta"]
+        .map(propio_map)
+        .fillna(False)
+        .astype(bool)
+    )
+
+    rutas_propias_dia = sorted(
+        baseline_completo.loc[
+            baseline_completo["es_ruta_propia"],
+            "ruta"
+        ].dropna().unique()
+    )
 
     # Demanda autorizada para optimización de capacidades.
     if optimizar_reservas_propias:
         baseline_cap = baseline_completo.copy()
     else:
-        baseline_cap = baseline_completo[~baseline_completo["es_ruta_propia"]].copy()
-
-    # Demanda autorizada para optimización de ruta.
-    # Este escenario no reasigna reservas entre vehículos.
-    if optimizar_reservas_propias:
-        baseline_ruta = baseline_completo[
-            (~baseline_completo["es_ruta_propia"]) |
-            (baseline_completo["ruta"].isin(vehiculos_propios_incluidos))
+        baseline_cap = baseline_completo[
+            ~baseline_completo["es_ruta_propia"]
         ].copy()
-    else:
-        baseline_ruta = baseline_completo[~baseline_completo["es_ruta_propia"]].copy()
 
     # Flota real completa del día.
-    flota_bl_completa = construir_flotas_baseline(baseline_completo, dicruta)
-    flota_bl_completa["es_propio"] = flota_bl_completa["vehiculo_base"].map(propio_map).fillna(False).astype(bool)
+    flota_bl_completa = construir_flotas_baseline(
+        baseline_completo,
+        dicruta
+    )
 
-    # Flota para optimización de capacidades: terceros + propios seleccionados.
-    flota_cap_base = flota_bl_completa[~flota_bl_completa["es_propio"]].copy()
-    if vehiculos_propios_incluidos:
-        flota_prop_sel = flota_bl_completa[
-            flota_bl_completa["vehiculo_base"].isin(vehiculos_propios_incluidos)
-        ].copy()
-        flota_cap_base = pd.concat([flota_cap_base, flota_prop_sel], ignore_index=True).drop_duplicates("vehiculo_base")
+    flota_bl_completa["es_propio"] = (
+        flota_bl_completa["vehiculo_base"]
+        .map(propio_map)
+        .fillna(False)
+        .astype(bool)
+    )
 
-    # Flota para optimización de ruta: terceros + propios seleccionados.
-    flota_ruta = flota_bl_completa[
-        (~flota_bl_completa["es_propio"]) |
-        (flota_bl_completa["vehiculo_base"].isin(vehiculos_propios_incluidos))
+    # Flota de capacidades: terceros + propios seleccionados.
+    flota_cap_base = flota_bl_completa[
+        ~flota_bl_completa["es_propio"]
     ].copy()
 
-    max_capacidad_disponible = float(flota_cap_base["capacidad"].max()) if not flota_cap_base.empty else DEFAULT_CAPACIDAD
-    puntos_cap = preparar_puntos(baseline_cap, cols, max_capacidad=max_capacidad_disponible, dicruta=dicruta)
-    puntos_ruta = preparar_puntos(baseline_ruta, cols, max_capacidad=max_capacidad_disponible, dicruta=dicruta)
+    if vehiculos_propios_incluidos:
+        flota_prop_sel = flota_bl_completa[
+            flota_bl_completa["vehiculo_base"].isin(
+                vehiculos_propios_incluidos
+            )
+        ].copy()
+
+        flota_cap_base = (
+            pd.concat(
+                [flota_cap_base, flota_prop_sel],
+                ignore_index=True
+            )
+            .drop_duplicates("vehiculo_base")
+        )
+
+    max_capacidad_disponible = (
+        float(flota_cap_base["capacidad"].max())
+        if not flota_cap_base.empty
+        else DEFAULT_CAPACIDAD
+    )
+
+    puntos_cap = preparar_puntos(
+        baseline_cap,
+        cols,
+        max_capacidad=max_capacidad_disponible,
+        dicruta=dicruta
+    )
 
     flota_cap = construir_flotas_capacidades(
         flota_cap_base,
-        puntos_cap["volumen"].sum() if not puntos_cap.empty else 0
+        puntos_cap["volumen"].sum()
+        if not puntos_cap.empty
+        else 0,
+        tipos_ruta_priorizados=tipos_ruta_priorizados
     )
 
-    routes_ruta, detail_ruta, resumen_ruta, meta_ruta = optimizar_ruta_preservando_flota(puntos_ruta, flota_ruta, True)
-    routes_cap, detail_cap, resumen_cap, meta_cap = optimizar_cached(puntos_cap, flota_cap, "Optimización de capacidades", True, True)
-    no_asignadas_cap = meta_cap.get("no_asignadas", pd.DataFrame())
-    incompatibles_ruta = meta_ruta.get("incompatibles", pd.DataFrame())
-    diagnostico_baseline = _diagnostico_baseline(baseline_completo, dicruta, cols)
-    resumen_ruta = completar_resumen_ruta_con_flota(resumen_ruta, flota_ruta, "Optimización de ruta")
+    routes_cap, detail_cap, resumen_cap, meta_cap = optimizar_cached(
+        puntos_cap,
+        flota_cap,
+        "Optimización de capacidades",
+        True,
+        True
+    )
 
-    met_base = metricas_baseline(baseline_completo, dicruta, cols)
+    no_asignadas_cap = meta_cap.get(
+        "no_asignadas",
+        pd.DataFrame()
+    )
+
+    diagnostico_baseline = _diagnostico_baseline(
+        baseline_completo,
+        dicruta,
+        cols
+    )
+
+    comparacion_tipos_ruta = comparar_cantidad_por_tipo_ruta(
+        baseline_completo,
+        resumen_cap,
+        dicruta
+    )
+
+    met_base = metricas_baseline(
+        baseline_completo,
+        dicruta,
+        cols
+    )
+
     mets = pd.DataFrame([
         met_base,
-        metricas_opt(resumen_ruta, puntos_ruta, "Optimización de ruta", rutas_base_objetivo=int(flota_ruta["vehiculo_base"].nunique())),
-        metricas_opt(resumen_cap, puntos_cap, "Optimización de capacidades")
+        metricas_opt(
+            resumen_cap,
+            puntos_cap,
+            "Optimización de capacidades"
+        )
     ])
 
-    mets.loc[mets["escenario"].isin(["Optimización de ruta", "Optimización de capacidades"]), "cumplimiento_vh"] = 100.0
-    mets.insert(0, "fecha", fecha)
-    mets.insert(1, "comuna", comuna_sel if comuna_sel else "Todas")
-    mets["reservas_propias_optimizadas"] = bool(optimizar_reservas_propias)
-    mets["vehiculos_propios_habilitados"] = ", ".join(vehiculos_propios_incluidos) if vehiculos_propios_incluidos else "Ninguno"
+    mets.loc[
+        mets["escenario"].eq("Optimización de capacidades"),
+        "cumplimiento_vh"
+    ] = 100.0
 
-    escala_usada = float(puntos_cap["factor_escala_capacidad"].iloc[0]) if not puntos_cap.empty and "factor_escala_capacidad" in puntos_cap.columns else 1.0
+    mets.insert(0, "fecha", fecha)
+    mets.insert(
+        1,
+        "comuna",
+        comuna_sel if comuna_sel else "Todas"
+    )
+
+    mets["reservas_propias_optimizadas"] = bool(
+        optimizar_reservas_propias
+    )
+
+    mets["vehiculos_propios_habilitados"] = (
+        ", ".join(vehiculos_propios_incluidos)
+        if vehiculos_propios_incluidos
+        else "Ninguno"
+    )
+    mets["tipos_ruta_priorizados"] = (
+        ", ".join(tipos_ruta_priorizados)
+        if tipos_ruta_priorizados
+        else "Sin prioridad"
+    )
+
+    escala_usada = (
+        float(
+            puntos_cap["factor_escala_capacidad"].iloc[0]
+        )
+        if (
+            not puntos_cap.empty and
+            "factor_escala_capacidad" in puntos_cap.columns
+        )
+        else 1.0
+    )
 
     return dict(
         baseline=baseline_completo,
         puntos=puntos_cap,
-        puntos_ruta=puntos_ruta,
         metrics=mets,
-        routes_ruta=routes_ruta,
-        detail_ruta=detail_ruta,
-        resumen_ruta_opt=resumen_ruta,
-        meta_ruta=meta_ruta,
         routes_cap=routes_cap,
         detail_cap=detail_cap,
         resumen_cap_opt=resumen_cap,
         meta_cap=meta_cap,
         escala_capacidad=escala_usada,
         rutas_propias_detectadas=rutas_propias_dia,
-        optimizar_reservas_propias=bool(optimizar_reservas_propias),
-        vehiculos_propios_incluidos=list(vehiculos_propios_incluidos),
-        no_asignadas_cap=no_asignadas_cap, incompatibles_ruta=incompatibles_ruta, diagnostico_baseline=diagnostico_baseline,
-        validaciones_dicruta=pd.DataFrame(DICRUTA_VALIDACIONES)
+        optimizar_reservas_propias=bool(
+            optimizar_reservas_propias
+        ),
+        vehiculos_propios_incluidos=list(
+            vehiculos_propios_incluidos
+        ),
+        tipos_ruta_priorizados=list(
+            tipos_ruta_priorizados
+        ),
+        no_asignadas_cap=no_asignadas_cap,
+        diagnostico_baseline=diagnostico_baseline,
+        comparacion_tipos_ruta=comparacion_tipos_ruta,
+        validaciones_dicruta=pd.DataFrame(
+            DICRUTA_VALIDACIONES
+        )
     )
 
 # ============================================================
@@ -1813,7 +1992,7 @@ else:
 
 with st.expander(titulo_propios, expanded=False):
     st.caption(
-        "Define si las reservas y los vehículos propios participarán en los escenarios optimizados. "
+        "Define si las reservas y los vehículos propios participarán en la optimización de capacidades. "
         "Esta decisión se aplica a todos los días ejecutados con los filtros actuales."
     )
     config_propios = construir_configuracion_propios(
@@ -1852,7 +2031,8 @@ with tab_analisis:
         res = ejecutar_escenarios_dia(
             f, clases_sel, tipos_sel, comuna_sel,
             optimizar_reservas_propias=optimizar_reservas_propias,
-            vehiculos_propios_incluidos=vehiculos_propios_incluidos
+            vehiculos_propios_incluidos=vehiculos_propios_incluidos,
+            tipos_ruta_priorizados=tipos_ruta_priorizados
         )
         rows.append(res["metrics"])
         if prog: prog.progress((i+1)/len(fechas), text=f"Escenarios calculados: {i+1}/{len(fechas)}")
@@ -1923,7 +2103,8 @@ with tab_macro:
         sim = ejecutar_escenarios_dia(
             fecha_sel, clases_dia, tipos_dia, comuna_dia,
             optimizar_reservas_propias=optimizar_reservas_propias,
-            vehiculos_propios_incluidos=vehiculos_propios_incluidos
+            vehiculos_propios_incluidos=vehiculos_propios_incluidos,
+            tipos_ruta_priorizados=tipos_ruta_priorizados
         )
     st.session_state["sim_dia"] = sim
 
@@ -1938,24 +2119,37 @@ with tab_macro:
       </div>
     </div>
     ''', unsafe_allow_html=True)
-    st.info("Baseline representa la operación real. Los escenarios optimizados permiten comparar mejoras sobre la misma demanda operativa disponible.")
-    estados_ok = {"ok", "ok_con_no_asignadas", "ok_ruta_preservada", "ok_ruta_preservada_con_incompatibilidades"}
-    if sim.get("meta_ruta", {}).get("status") not in estados_ok or sim.get("meta_cap", {}).get("status") not in estados_ok:
-        st.warning("No fue posible generar todos los escenarios con los filtros seleccionados. Revisa la demanda disponible y vuelve a intentar.")
+    st.info("Baseline representa la operación real. La optimización de capacidades permite comparar mejoras sobre la misma demanda operativa disponible.")
+    if tipos_ruta_priorizados:
+        st.caption(
+            "Tipos de ruta priorizados en esta simulación: "
+            + ", ".join(tipos_ruta_priorizados)
+        )
+    estados_ok = {"ok", "ok_con_no_asignadas"}
+    if sim.get("meta_cap", {}).get("status") not in estados_ok:
+        st.warning("No fue posible generar la optimización de capacidades con los filtros seleccionados. Revisa la demanda disponible y vuelve a intentar.")
     else:
         st.success("Escenarios generados correctamente.")
 
-    d1,d2,d3,d4 = st.columns(4)
-    d1.metric("Reservas no asignadas", len(sim.get("no_asignadas_cap", pd.DataFrame())))
-    inc_r = sim.get("incompatibles_ruta", pd.DataFrame())
-    d2.metric("Incompatibles por volumen", int(inc_r.get("motivos", pd.Series(dtype=str)).astype(str).str.contains("volumen", case=False).sum()) if not inc_r.empty else 0)
-    d3.metric("Incompatibles por BT", int(inc_r.get("motivos", pd.Series(dtype=str)).astype(str).str.contains("BT", case=False).sum()) if not inc_r.empty else 0)
-    d4.metric("Rutas con configuración inválida", int((~dicruta["config_valida"]).sum()))
-    with st.expander("Reservas no asignadas e incompatibilidades", expanded=False):
-        st.markdown("##### Optimización de capacidades · Reservas no asignadas")
-        st.dataframe(sim.get("no_asignadas_cap", pd.DataFrame()), use_container_width=True, hide_index=True)
-        st.markdown("##### Optimización de ruta · Incompatibilidades sin reasignación")
-        st.dataframe(sim.get("incompatibles_ruta", pd.DataFrame()), use_container_width=True, hide_index=True)
+    d1, d2 = st.columns(2)
+    d1.metric(
+        "Reservas no asignadas",
+        len(sim.get("no_asignadas_cap", pd.DataFrame()))
+    )
+    d2.metric(
+        "Rutas con configuración inválida",
+        int((~dicruta["config_valida"]).sum())
+    )
+
+    with st.expander("Reservas no asignadas", expanded=False):
+        st.markdown(
+            "##### Optimización de capacidades · Reservas no asignadas"
+        )
+        st.dataframe(
+            sim.get("no_asignadas_cap", pd.DataFrame()),
+            use_container_width=True,
+            hide_index=True
+        )
 
     macro = sim["metrics"].copy()
     cols_show = ["escenario","cantidad_rutas","total_os","cumplimiento_vh","vueltas","volumen","capacidad_total","excepciones","reservas","productividad","factor_ocupacion","ocupacion_vehiculo_dia","tiempo_ruta"]
@@ -1964,7 +2158,7 @@ with tab_macro:
     fmt.update({"productividad": "{:.1f}", "tiempo_ruta": "{:.1f}", "volumen": "{:.3f}", "capacidad_total": "{:.3f}", "total_os":"{:.0f}", "reservas":"{:.0f}"})
 
     st.markdown("#### Cuadro comparativo")
-    card_cols = st.columns(3)
+    card_cols = st.columns(2)
     for idx, (_, row) in enumerate(macro.iterrows()):
         with card_cols[idx]:
             st.markdown(f"""
@@ -1987,55 +2181,232 @@ with tab_macro:
     st.markdown("#### Tabla detalle")
     st.dataframe(macro[cols_show].style.format(fmt, na_rep="-"), use_container_width=True, hide_index=True)
 
-    b, r, c = macro.iloc[0], macro.iloc[1], macro.iloc[2]
-    k1,k2,k3,k4 = st.columns(4)
-    k1.metric("Rutas baseline", num(b["cantidad_rutas"]))
-    k2.metric("Rutas opt. ruta", num(r["cantidad_rutas"]), delta=num(r["cantidad_rutas"]-b["cantidad_rutas"]))
-    k3.metric("Rutas opt. capacidades", num(c["cantidad_rutas"]), delta=num(c["cantidad_rutas"]-b["cantidad_rutas"]))
-    k4.metric("OS del día", num(b["total_os"]))
-    st.caption("Baseline muestra el contexto completo. Los escenarios optimizados muestran demanda PU optimizable; por eso reservas/OS pueden bajar si había excepciones o puntos sin coordenadas.")
+    b, c = macro.iloc[0], macro.iloc[1]
+    k1, k2, k3 = st.columns(3)
+    k1.metric(
+        "Rutas baseline",
+        num(b["cantidad_rutas"])
+    )
+    k2.metric(
+        "Rutas opt. capacidades",
+        num(c["cantidad_rutas"]),
+        delta=num(
+            c["cantidad_rutas"] - b["cantidad_rutas"]
+        )
+    )
+    k3.metric(
+        "OS del día",
+        num(b["total_os"])
+    )
+    st.caption("Baseline muestra el contexto completo. La optimización de capacidades muestra demanda PU optimizable; por eso reservas/OS pueden bajar si había excepciones o puntos sin coordenadas.")
+
+    st.markdown("#### Comparación de cantidad por tipo de ruta")
+    st.caption(
+        "Se cuentan rutas físicas únicas. Una ruta con vuelta AM y PM se contabiliza una sola vez."
+    )
+
+    comp_tipos = sim.get("comparacion_tipos_ruta", pd.DataFrame()).copy()
+
+    if comp_tipos.empty:
+        st.info("No hay información de tipos de ruta para comparar.")
+    else:
+        st.dataframe(
+            comp_tipos,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        comp_chart = comp_tipos.melt(
+            id_vars=["Tipo de ruta"],
+            value_vars=["Baseline", "Optimización de capacidades"],
+            var_name="Escenario",
+            value_name="Cantidad de rutas"
+        )
+
+        grafico_tipos = (
+            alt.Chart(comp_chart)
+            .mark_bar()
+            .encode(
+                x=alt.X(
+                    "Tipo de ruta:N",
+                    title="Tipo de ruta",
+                    sort="-y"
+                ),
+                y=alt.Y(
+                    "Cantidad de rutas:Q",
+                    title="Cantidad de rutas",
+                    axis=alt.Axis(tickMinStep=1)
+                ),
+                xOffset="Escenario:N",
+                color=alt.Color(
+                    "Escenario:N",
+                    title="Escenario"
+                ),
+                tooltip=[
+                    "Tipo de ruta:N",
+                    "Escenario:N",
+                    alt.Tooltip(
+                        "Cantidad de rutas:Q",
+                        format=".0f"
+                    )
+                ]
+            )
+            .properties(height=320)
+        )
+
+        st.altair_chart(
+            grafico_tipos,
+            use_container_width=True
+        )
 
 with tab_rutas:
-    st.markdown('<div class="section-title">Análisis por ruta / mapas OSRM</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-title">Análisis por ruta / mapas OSRM</div>',
+        unsafe_allow_html=True
+    )
     st.caption(f"Filtro aplicado · Comuna: {filtro_comuna}")
+
     sim = st.session_state.get("sim_dia")
     if sim is None:
-        st.warning("Primero entra a Datos macro diarios para seleccionar el día."); st.stop()
-    sub1, sub2, sub3, sub4 = st.tabs(["Baseline", "Optimización de ruta", "Optimización de capacidades", "Tablas"])
+        st.warning(
+            "Primero entra a Datos macro diarios para seleccionar el día."
+        )
+        st.stop()
+
+    sub1, sub2, sub3 = st.tabs([
+        "Baseline",
+        "Optimización de capacidades",
+        "Tablas"
+    ])
+
     with sub1:
-        stops_bl, paths_bl = preparar_mapa_baseline(sim["baseline"], cols)
+        stops_bl, paths_bl = preparar_mapa_baseline(
+            sim["baseline"],
+            cols
+        )
+
         if not stops_bl.empty:
-            stops_bl["id_punto_opt"] = stops_bl[cols["col_reserva"]].astype(str) if cols["col_reserva"] else "-"
-            stops_bl["vehiculo_base"] = stops_bl["ruta"]; stops_bl["eta"] = stops_bl["datetime_gestion"].dt.strftime("%H:%M")
-            stops_bl["os"] = pd.to_numeric(stops_bl[cols["col_q_os"]], errors="coerce").fillna(0) if cols["col_q_os"] else 1
+            stops_bl["id_punto_opt"] = (
+                stops_bl[cols["col_reserva"]].astype(str)
+                if cols["col_reserva"]
+                else "-"
+            )
+            stops_bl["vehiculo_base"] = stops_bl["ruta"]
+            stops_bl["eta"] = (
+                stops_bl["datetime_gestion"]
+                .dt.strftime("%H:%M")
+            )
+            stops_bl["os"] = (
+                pd.to_numeric(
+                    stops_bl[cols["col_q_os"]],
+                    errors="coerce"
+                ).fillna(0)
+                if cols["col_q_os"]
+                else 1
+            )
+
             if cols["col_km"]:
-                q_os_mapa = pd.to_numeric(stops_bl[cols["col_q_os"]], errors="coerce").fillna(1) if cols["col_q_os"] else pd.Series(1, index=stops_bl.index)
-                ajuste_mapa = ajustar_volumen_m3(stops_bl[cols["col_km"]], q_os_mapa, ajuste_vol_por_os=stops_bl["ruta"].map(dicruta.set_index("ruta")["ajuste_vol"].to_dict()) if "ajuste_vol" in dicruta.columns else None, umbral_m3_por_os=3.0, m3_estandar_por_os=0.33)
-                stops_bl["volumen_original_m3"] = ajuste_mapa["volumen_original_m3"]
-                stops_bl["volumen"] = ajuste_mapa["volumen_m3"]
-                stops_bl["m3_por_os"] = ajuste_mapa["m3_por_os"]
-                stops_bl["volumen_ajustado"] = ajuste_mapa["volumen_ajustado"]
+                q_os_mapa = (
+                    pd.to_numeric(
+                        stops_bl[cols["col_q_os"]],
+                        errors="coerce"
+                    ).fillna(1)
+                    if cols["col_q_os"]
+                    else pd.Series(
+                        1,
+                        index=stops_bl.index
+                    )
+                )
+
+                ajuste_mapa = ajustar_volumen_m3(
+                    stops_bl[cols["col_km"]],
+                    q_os_mapa,
+                    ajuste_vol_por_os=(
+                        stops_bl["ruta"].map(
+                            dicruta.set_index("ruta")[
+                                "ajuste_vol"
+                            ].to_dict()
+                        )
+                        if "ajuste_vol" in dicruta.columns
+                        else None
+                    ),
+                    umbral_m3_por_os=3.0,
+                    m3_estandar_por_os=0.33
+                )
+
+                stops_bl["volumen_original_m3"] = (
+                    ajuste_mapa["volumen_original_m3"]
+                )
+                stops_bl["volumen"] = (
+                    ajuste_mapa["volumen_m3"]
+                )
+                stops_bl["m3_por_os"] = (
+                    ajuste_mapa["m3_por_os"]
+                )
+                stops_bl["volumen_ajustado"] = (
+                    ajuste_mapa["volumen_ajustado"]
+                )
             else:
                 stops_bl["volumen_original_m3"] = 0
                 stops_bl["volumen"] = 0
                 stops_bl["m3_por_os"] = 0
                 stops_bl["volumen_ajustado"] = False
-        render_map(stops_bl, paths_bl, "Mapa Baseline por calles OSRM", key_prefix="mapa_baseline")
+
+        render_map(
+            stops_bl,
+            paths_bl,
+            "Mapa Baseline por calles OSRM",
+            key_prefix="mapa_baseline"
+        )
+
     with sub2:
-        stops_r, paths_r = preparar_mapa_opt(sim["routes_ruta"])
-        render_map(stops_r, paths_r, "Mapa Optimización de ruta por calles OSRM", key_prefix="mapa_opt_ruta")
+        stops_c, paths_c = preparar_mapa_opt(
+            sim["routes_cap"]
+        )
+        render_map(
+            stops_c,
+            paths_c,
+            "Mapa Optimización de capacidades por calles OSRM",
+            key_prefix="mapa_opt_cap"
+        )
+
     with sub3:
-        stops_c, paths_c = preparar_mapa_opt(sim["routes_cap"])
-        render_map(stops_c, paths_c, "Mapa Optimización de capacidades por calles OSRM", key_prefix="mapa_opt_cap")
-    with sub4:
         st.markdown("#### Resumen por ruta / vuelta")
-        resumen_bl_ruta = resumen_por_ruta_baseline(sim["baseline"], dicruta, cols)
-        resumen_bl_vuelta = resumen_por_vuelta_baseline(sim["baseline"], dicruta, cols)
-        t1,t2,t3,t4 = st.tabs(["Baseline ruta", "Baseline vuelta", "Opt. ruta", "Opt. capacidades"])
-        with t1: st.dataframe(resumen_bl_ruta, use_container_width=True)
-        with t2: st.dataframe(resumen_bl_vuelta, use_container_width=True)
-        with t3: st.dataframe(sim["resumen_ruta_opt"], use_container_width=True)
-        with t4: st.dataframe(sim["resumen_cap_opt"], use_container_width=True)
+
+        resumen_bl_ruta = resumen_por_ruta_baseline(
+            sim["baseline"],
+            dicruta,
+            cols
+        )
+        resumen_bl_vuelta = resumen_por_vuelta_baseline(
+            sim["baseline"],
+            dicruta,
+            cols
+        )
+
+        t1, t2, t3 = st.tabs([
+            "Baseline ruta",
+            "Baseline vuelta",
+            "Opt. capacidades"
+        ])
+
+        with t1:
+            st.dataframe(
+                resumen_bl_ruta,
+                use_container_width=True
+            )
+
+        with t2:
+            st.dataframe(
+                resumen_bl_vuelta,
+                use_container_width=True
+            )
+
+        with t3:
+            st.dataframe(
+                sim["resumen_cap_opt"],
+                use_container_width=True
+            )
 
 with tab_exportar:
     st.markdown('<div class="section-title">Exportar</div>', unsafe_allow_html=True)
@@ -2064,29 +2435,28 @@ with tab_exportar:
                 sim_tmp = ejecutar_escenarios_dia(
                     f, clases_exp, tipos_exp, comuna_exp,
                     optimizar_reservas_propias=optimizar_reservas_propias,
-                    vehiculos_propios_incluidos=vehiculos_propios_incluidos
+                    vehiculos_propios_incluidos=vehiculos_propios_incluidos,
+            tipos_ruta_priorizados=tipos_ruta_priorizados
                 )
                 sims.append((f, sim_tmp))
                 prog.progress((i+1)/len(fechas_sel_exp), text=f"Días preparados: {i+1}/{len(fechas_sel_exp)}")
             prog.empty()
 
-            output_name = "baseline_optimizador_pm_export.xlsx"
+            output_name = "baseline_optimizador_capacidades_export.xlsx"
             all_metrics=[]; all_baseline=[]; all_bl_ruta=[]; all_bl_vuelta=[]
-            all_opt_ruta_res=[]; all_opt_ruta_det=[]; all_opt_cap_res=[]; all_opt_cap_det=[]; all_puntos=[]; all_no_asig=[]; all_incompat_ruta=[]; all_diag_bl=[]
+            all_opt_cap_res=[]; all_opt_cap_det=[]; all_puntos=[]; all_no_asig=[]; all_diag_bl=[]; all_tipos_ruta=[]
 
             for f, sim_tmp in sims:
                 all_metrics.append(sim_tmp["metrics"].assign(fecha_export=f))
                 all_baseline.append(sim_tmp["baseline"].assign(fecha_export=f))
                 all_bl_ruta.append(resumen_por_ruta_baseline(sim_tmp["baseline"], dicruta, cols).assign(fecha_export=f))
                 all_bl_vuelta.append(resumen_por_vuelta_baseline(sim_tmp["baseline"], dicruta, cols).assign(fecha_export=f))
-                all_opt_ruta_res.append(sim_tmp["resumen_ruta_opt"].assign(fecha_export=f))
-                all_opt_ruta_det.append(sim_tmp["detail_ruta"].assign(fecha_export=f))
                 all_opt_cap_res.append(sim_tmp["resumen_cap_opt"].assign(fecha_export=f))
                 all_opt_cap_det.append(sim_tmp["detail_cap"].assign(fecha_export=f))
                 all_puntos.append(sim_tmp["puntos"].assign(fecha_export=f))
                 all_no_asig.append(sim_tmp.get("no_asignadas_cap", pd.DataFrame()).assign(fecha_export=f))
-                all_incompat_ruta.append(sim_tmp.get("incompatibles_ruta", pd.DataFrame()).assign(fecha_export=f))
                 all_diag_bl.append(sim_tmp.get("diagnostico_baseline", pd.DataFrame()).assign(fecha_export=f))
+                all_tipos_ruta.append(sim_tmp.get("comparacion_tipos_ruta", pd.DataFrame()).assign(fecha_export=f))
 
             output_buffer = BytesIO()
             with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
@@ -2094,14 +2464,12 @@ with tab_exportar:
                 concatenar_no_vacios(all_baseline).to_excel(writer, sheet_name="baseline_detalle", index=False)
                 concatenar_no_vacios(all_bl_ruta).to_excel(writer, sheet_name="baseline_resumen_ruta", index=False)
                 concatenar_no_vacios(all_bl_vuelta).to_excel(writer, sheet_name="baseline_resumen_vuelta", index=False)
-                concatenar_no_vacios(all_opt_ruta_res).to_excel(writer, sheet_name="opt_ruta_resumen", index=False)
-                concatenar_no_vacios(all_opt_ruta_det).to_excel(writer, sheet_name="opt_ruta_detalle", index=False)
                 concatenar_no_vacios(all_opt_cap_res).to_excel(writer, sheet_name="opt_cap_resumen", index=False)
                 concatenar_no_vacios(all_opt_cap_det).to_excel(writer, sheet_name="opt_cap_detalle", index=False)
                 concatenar_no_vacios(all_puntos).to_excel(writer, sheet_name="demanda_optimizable", index=False)
                 concatenar_no_vacios(all_no_asig).to_excel(writer, sheet_name="reservas_no_asignadas", index=False)
-                concatenar_no_vacios(all_incompat_ruta).to_excel(writer, sheet_name="opt_ruta_incompatibles", index=False)
                 concatenar_no_vacios(all_diag_bl).to_excel(writer, sheet_name="baseline_diagnostico", index=False)
+                concatenar_no_vacios(all_tipos_ruta).to_excel(writer, sheet_name="comparacion_tipos_ruta", index=False)
                 pd.DataFrame(DICRUTA_VALIDACIONES).to_excel(writer, sheet_name="validaciones_dicruta", index=False)
                 dicruta.to_excel(writer, sheet_name="dicruta_configuracion", index=False)
 
