@@ -71,6 +71,9 @@ OSRM_ROUTE_TIMEOUT_SECONDS = int(os.getenv("OSRM_ROUTE_TIMEOUT_SECONDS", "12"))
 OSRM_MAX_MATRIX_POINTS = int(os.getenv("OSRM_MAX_MATRIX_POINTS", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
 PENALIZACION_RUTA_NO_PRIORIZADA = int(os.getenv("PENALIZACION_RUTA_NO_PRIORIZADA", "5000"))
+PENALIZACION_POR_NIVEL_PRIORIDAD = int(os.getenv("PENALIZACION_POR_NIVEL_PRIORIDAD", "5000"))
+TIPO_RUTA_ANCLAJE_AM = os.getenv("TIPO_RUTA_ANCLAJE_AM", "SL5 MALL").strip().upper()
+HORA_CORTE_ANCLAJE_AM_MIN = int(os.getenv("HORA_CORTE_ANCLAJE_AM_MIN", str(13 * 60)))
 # Costo fijo que paga el solver por cada vehículo/vuelta que decide abrir.
 # Es la palanca principal para el objetivo "menos rutas, mayor ocupación":
 # mientras más alto, más agresivamente el optimizador consolida carga en
@@ -357,18 +360,20 @@ def get_route_geometry(coords_tuple, usar_osrm=True):
 
 
 def construir_flotas_capacidades(flota_baseline, demanda_total=0, tipos_ruta_priorizados=None):
-    """
-    Optimización de capacidades.
+    """Construye la flota y conserva el orden jerárquico indicado por el usuario.
 
-    - Usa el mismo universo de vehículos/rutas del baseline del día y permite usar menos.
-    - Respeta todas las restricciones operacionales.
-    - Cuando se seleccionan tipos de ruta prioritarios, intenta asignarles carga primero.
-    - La prioridad es suave: si esas rutas no son suficientes o compatibles, usa el resto.
+    La lista ``tipos_ruta_priorizados`` debe venir ordenada desde prioridad 1
+    hasta la última prioridad. Las rutas no seleccionadas quedan después de
+    todos los niveles definidos. La jerarquía sigue siendo suave: una ruta de
+    menor prioridad puede usarse si permite cumplir restricciones o evitar una
+    solución inviable.
     """
-    tipos_ruta_priorizados = {
-        str(x).strip().upper()
-        for x in (tipos_ruta_priorizados or [])
-    }
+    prioridades = []
+    for x in (tipos_ruta_priorizados or []):
+        tipo = str(x).strip().upper()
+        if tipo and tipo not in prioridades:
+            prioridades.append(tipo)
+    prioridad_map = {tipo: i + 1 for i, tipo in enumerate(prioridades)}
 
     flota = flota_baseline.copy()
     if flota.empty:
@@ -382,29 +387,25 @@ def construir_flotas_capacidades(flota_baseline, demanda_total=0, tipos_ruta_pri
         ])
 
     flota["capacidad"] = pd.to_numeric(
-        flota["capacidad"],
-        errors="coerce"
+        flota["capacidad"], errors="coerce"
     ).fillna(DEFAULT_CAPACIDAD)
 
     if "tipo_ruta" not in flota.columns:
         flota["tipo_ruta"] = "SIN INFORMACIÓN"
 
     flota["tipo_ruta_norm"] = (
-        flota["tipo_ruta"]
-        .astype(str)
-        .str.strip()
-        .str.upper()
+        flota["tipo_ruta"].astype(str).str.strip().str.upper()
     )
-
-    flota["es_tipo_priorizado"] = (
-        flota["tipo_ruta_norm"].isin(tipos_ruta_priorizados)
-        if tipos_ruta_priorizados
-        else False
-    )
+    flota["prioridad_tipo_ruta"] = flota["tipo_ruta_norm"].map(prioridad_map)
+    flota["es_tipo_priorizado"] = flota["prioridad_tipo_ruta"].notna()
+    flota["prioridad_tipo_ruta"] = flota["prioridad_tipo_ruta"].fillna(
+        len(prioridades) + 1 if prioridades else 1
+    ).astype(int)
+    flota["cantidad_niveles_prioridad"] = len(prioridades)
 
     return flota.sort_values(
-        ["es_tipo_priorizado", "capacidad", "vehiculo_base"],
-        ascending=[False, False, True]
+        ["prioridad_tipo_ruta", "capacidad", "vehiculo_base"],
+        ascending=[True, False, True]
     ).reset_index(drop=True)
 
 # El motor de optimización se define en la sección V18 antes de la interfaz.
@@ -594,6 +595,13 @@ def preparar_mapa_baseline(baseline, cols):
         })
 
     mapa = mapa.rename(columns={lat_col: "lat", lon_col: "lon"})
+    if "direccion" not in mapa.columns:
+        mapa["direccion"] = "SIN DIRECCIÓN"
+    mapa["direccion"] = mapa["direccion"].astype("string").fillna("SIN DIRECCIÓN")
+    if "estado_ventana" in mapa.columns:
+        mapa["estado_horario"] = mapa["estado_ventana"]
+    else:
+        mapa["estado_horario"] = "Sin ventana válida"
 
     return mapa, pd.DataFrame(paths)
 
@@ -612,7 +620,13 @@ def preparar_mapa_opt(routes):
                 "color": r["color"]
         })
         for s in r["stops"]:
-            row=s.copy(); row["color"]=r["color"]; row["orden_txt"]=str(row["secuencia"]); stops.append(row)
+            row = s.copy()
+            row["color"] = r["color"]
+            row["orden_txt"] = str(row["secuencia"])
+            row.setdefault("direccion", "SIN DIRECCIÓN")
+            row.setdefault("estado_horario", "Sin ventana válida")
+            row.setdefault("ruta", veh)
+            stops.append(row)
     return pd.DataFrame(stops), pd.DataFrame(paths)
 
 def render_map(stops, paths, title, key_prefix="mapa"):
@@ -732,7 +746,7 @@ def render_map(stops, paths, title, key_prefix="mapa"):
     )
 
     tooltip = {
-        "html": "<b>ID:</b> {id_punto_opt}<br/><b>Ruta:</b> {ruta}<br/><b>Vehículo:</b> {vehiculo_base}<br/><b>Vuelta:</b> {vuelta}<br/><b>Bloque:</b> {bloque}<br/><b>Orden:</b> {orden_txt}<br/><b>ETA:</b> {eta}<br/><b>OS:</b> {os}<br/><b>Volumen m³:</b> {volumen}",
+        "html": "<b>ID:</b> {id_punto_opt}<br/><b>Dirección:</b> {direccion}<br/><b>Ruta:</b> {ruta}<br/><b>Vehículo:</b> {vehiculo_base}<br/><b>Vuelta:</b> {vuelta}<br/><b>Bloque:</b> {bloque}<br/><b>Orden:</b> {orden_txt}<br/><b>ETA:</b> {eta}<br/><b>Estado horario:</b> {estado_horario}<br/><b>OS:</b> {os}<br/><b>Volumen m³:</b> {volumen}",
         "style": {"backgroundColor": "white", "color": "black"}
     }
 
@@ -895,6 +909,10 @@ def preparar_data(peu_raw, accesos_raw):
     col_fin_vh = buscar_columna(peu, ["termino_vh", "fin_vh", "fin ventana", "ventana_fin"])
     col_reserva = buscar_columna(peu, ["reserva"])
     col_comuna = buscar_columna(peu, ["comuna", "comuna_destino", "comuna destino"])
+    col_direccion = buscar_columna(peu, [
+        "direccion", "dirección", "direccion_reserva", "dirección_reserva",
+        "direccion reserva", "dirección reserva", "domicilio", "address"
+    ])
     col_q_os = buscar_columna(peu, ["q_os", "cantidad_os", "cantidad de os"])
     col_q_os_b = buscar_columna(peu, ["q_os_b", "q os b", "big ticket"])
     col_km = buscar_columna(peu, ["kilomayor", "kilo_mayor", "kilo mayor", "kmayor", "kmay_ajustado"])
@@ -907,6 +925,10 @@ def preparar_data(peu_raw, accesos_raw):
     peu["clase_ruta"] = peu[col_clase].astype(str).str.upper().str.strip()
     peu["tipo_ruta"] = peu[col_tipo].astype(str).str.upper().str.strip() if col_tipo else "SIN TIPO"
     peu["comuna"] = peu[col_comuna].astype(str).str.upper().str.strip() if col_comuna else "SIN COMUNA"
+    peu["direccion"] = (
+        peu[col_direccion].astype("string").fillna("SIN DIRECCIÓN").str.strip()
+        if col_direccion else "SIN DIRECCIÓN"
+    )
     peu["fecha_operacion"] = pd.to_datetime(peu[col_fecha_peu], errors="coerce").dt.date
     accesos["solo_fch"] = pd.to_datetime(accesos[col_fecha_acc], errors="coerce").dt.date
     peu["datetime_gestion"] = pd.to_datetime(peu["fecha_operacion"].astype(str)+" "+peu[col_hora_peu].astype(str), errors="coerce")
@@ -933,7 +955,7 @@ def preparar_data(peu_raw, accesos_raw):
     peu["cumple_ventana"]=peu.apply(cumple_vh,axis=1)
     peu["estado_ventana"]=np.where(peu["cumple_ventana"].eq(True),"Cumple",np.where(peu["cumple_ventana"].eq(False),"No cumple","Sin ventana válida"))
     peu=peu.dropna(subset=["fecha_operacion","datetime_gestion","ruta"]); accesos=accesos.dropna(subset=["solo_fch","datetime_ingreso","ruta"])
-    cols=dict(col_reserva=col_reserva,col_comuna=col_comuna,col_q_os=col_q_os,col_q_os_b=col_q_os_b,col_km=col_km,col_piezas=col_piezas,lat_col=lat_col,lon_col=lon_col)
+    cols=dict(col_reserva=col_reserva,col_comuna=col_comuna,col_direccion=col_direccion,col_q_os=col_q_os,col_q_os_b=col_q_os_b,col_km=col_km,col_piezas=col_piezas,lat_col=lat_col,lon_col=lon_col)
     return peu,accesos,cols,[]
 
 
@@ -952,52 +974,164 @@ def ajustar_volumen_m3(kilo_mayor, q_os, ajuste_vol_por_os=None, umbral_m3_por_o
 
 
 def preparar_puntos(df, cols, max_capacidad=None, dicruta=None):
-    lat_col,lon_col=cols["lat_col"],cols["lon_col"]; col_reserva=cols["col_reserva"]; col_q_os=cols["col_q_os"]; col_q_os_b=cols.get("col_q_os_b"); col_km=cols["col_km"]
-    if not lat_col or not lon_col: return pd.DataFrame()
-    d=df.dropna(subset=[lat_col,lon_col]).copy(); d=d[d["evento_norm"].isin(EVENTOS_OPTIMIZABLES)].copy()
-    if d.empty: return pd.DataFrame()
-    d["_es_visita_sin_carga"]=d["evento_norm"].isin(["CSC","CNP","NHP"])
-    d["id_punto_opt"]=d[col_reserva].astype(str) if col_reserva else d[lat_col].round(6).astype(str)+"_"+d[lon_col].round(6).astype(str)
-    d["_os"]=pd.to_numeric(d[col_q_os],errors="coerce").fillna(1) if col_q_os else 1; d.loc[d["_os"]<=0,"_os"]=1
-    d["_q_os_b"]=pd.to_numeric(d[col_q_os_b],errors="coerce").fillna(0).clip(lower=0) if col_q_os_b else 0
-    d["_kilo"]=pd.to_numeric(d[col_km],errors="coerce").fillna(0).clip(lower=0) if col_km else 0
-    ajuste_map=dicruta.set_index("ruta")["ajuste_vol"].to_dict() if dicruta is not None and "ajuste_vol" in dicruta.columns else {}
-    d["_ajuste_ruta"]=d["ruta"].map(ajuste_map)
-    aj=ajustar_volumen_m3(d[col_km],d["_os"],ajuste_vol_por_os=d["_ajuste_ruta"]) if col_km else pd.DataFrame(index=d.index)
-    d["_volumen_original"]=aj.get("volumen_original_m3",0); d["_volumen"]=aj.get("volumen_m3",0); d["_m3_por_os"]=aj.get("m3_por_os",0); d["_ajuste_usado"]=aj.get("ajuste_vol_usado",0.33); d["_volumen_ajustado"]=aj.get("volumen_ajustado",False)
+    lat_col, lon_col = cols["lat_col"], cols["lon_col"]
+    col_reserva, col_q_os = cols["col_reserva"], cols["col_q_os"]
+    col_q_os_b, col_km = cols.get("col_q_os_b"), cols["col_km"]
+    if not lat_col or not lon_col:
+        return pd.DataFrame()
+
+    d = df.dropna(subset=[lat_col, lon_col]).copy()
+    d = d[d["evento_norm"].isin(EVENTOS_OPTIMIZABLES)].copy()
+    if d.empty:
+        return pd.DataFrame()
+
+    if "direccion" not in d.columns:
+        d["direccion"] = "SIN DIRECCIÓN"
+    d["direccion"] = d["direccion"].astype("string").fillna("SIN DIRECCIÓN").str.strip()
+    d["_es_visita_sin_carga"] = d["evento_norm"].isin(["CSC", "CNP", "NHP"])
+    d["id_punto_opt"] = (
+        d[col_reserva].astype(str)
+        if col_reserva
+        else d[lat_col].round(6).astype(str) + "_" + d[lon_col].round(6).astype(str)
+    )
+    d["_os"] = pd.to_numeric(d[col_q_os], errors="coerce").fillna(1) if col_q_os else 1
+    d.loc[d["_os"] <= 0, "_os"] = 1
+    d["_q_os_b"] = pd.to_numeric(d[col_q_os_b], errors="coerce").fillna(0).clip(lower=0) if col_q_os_b else 0
+    d["_kilo"] = pd.to_numeric(d[col_km], errors="coerce").fillna(0).clip(lower=0) if col_km else 0
+
+    ajuste_map = dicruta.set_index("ruta")["ajuste_vol"].to_dict() if dicruta is not None and "ajuste_vol" in dicruta.columns else {}
+    d["_ajuste_ruta"] = d["ruta"].map(ajuste_map)
+    aj = ajustar_volumen_m3(d[col_km], d["_os"], ajuste_vol_por_os=d["_ajuste_ruta"]) if col_km else pd.DataFrame(index=d.index)
+    d["_volumen_original"] = aj.get("volumen_original_m3", 0)
+    d["_volumen"] = aj.get("volumen_m3", 0)
+    d["_m3_por_os"] = aj.get("m3_por_os", 0)
+    d["_ajuste_usado"] = aj.get("ajuste_vol_usado", 0.33)
+    d["_volumen_ajustado"] = aj.get("volumen_ajustado", False)
+
     # Excepciones se visitan, pero no consumen capacidad ni cupo BT.
-    d.loc[d["_es_visita_sin_carga"],["_os","_q_os_b","_kilo","_volumen_original","_volumen","_m3_por_os"]]=0
-    d.loc[d["_es_visita_sin_carga"],"_volumen_ajustado"]=False
-    group_cols=["id_punto_opt",lat_col,lon_col,"ventana_inicio","ventana_fin"]
-    opt=d.groupby(group_cols,dropna=False).agg(os=("_os","sum"),q_os_B=("_q_os_b","sum"),volumen=("_volumen","sum"),volumen_original=("_volumen_original","sum"),kilo_mayor=("_kilo","sum"),m3_por_os_max=("_m3_por_os","max"),ajuste_vol_usado=("_ajuste_usado","max"),volumen_ajustado=("_volumen_ajustado","max"),es_visita_sin_carga=("_es_visita_sin_carga","max"),datetime_gestion=("datetime_gestion","min"),ruta_original=("ruta","first"),vuelta_original=("vuelta","first")).reset_index().rename(columns={lat_col:"lat",lon_col:"lon"})
-    opt["reserva"]=opt["id_punto_opt"].astype(str); opt["conteo_reserva"]=1
-    opt["tw_start"]=opt["ventana_inicio"].apply(lambda x:time_to_minutes(x) if pd.notna(x) else np.nan).fillna(0).astype(int)
-    opt["tw_end"]=opt["ventana_fin"].apply(lambda x:time_to_minutes(x) if pd.notna(x) else np.nan).fillna(1439).astype(int)
-    mask=opt["tw_start"]>opt["tw_end"]; opt.loc[mask,["tw_start","tw_end"]]=[0,1439]
-    opt["factor_escala_capacidad"]=1.0
+    d.loc[d["_es_visita_sin_carga"], ["_os", "_q_os_b", "_kilo", "_volumen_original", "_volumen", "_m3_por_os"]] = 0
+    d.loc[d["_es_visita_sin_carga"], "_volumen_ajustado"] = False
+
+    group_cols = ["id_punto_opt", lat_col, lon_col, "ventana_inicio", "ventana_fin"]
+    opt = d.groupby(group_cols, dropna=False).agg(
+        direccion=("direccion", "first"),
+        os=("_os", "sum"),
+        q_os_B=("_q_os_b", "sum"),
+        volumen=("_volumen", "sum"),
+        volumen_original=("_volumen_original", "sum"),
+        kilo_mayor=("_kilo", "sum"),
+        m3_por_os_max=("_m3_por_os", "max"),
+        ajuste_vol_usado=("_ajuste_usado", "max"),
+        volumen_ajustado=("_volumen_ajustado", "max"),
+        es_visita_sin_carga=("_es_visita_sin_carga", "max"),
+        datetime_gestion=("datetime_gestion", "min"),
+        ruta_original=("ruta", "first"),
+        vuelta_original=("vuelta", "first")
+    ).reset_index().rename(columns={lat_col: "lat", lon_col: "lon"})
+
+    opt["reserva"] = opt["id_punto_opt"].astype(str)
+    opt["conteo_reserva"] = 1
+    opt["tw_start_original"] = opt["ventana_inicio"].apply(
+        lambda x: time_to_minutes(x) if pd.notna(x) else np.nan
+    ).fillna(0).astype(int)
+    opt["tw_end_original"] = opt["ventana_fin"].apply(
+        lambda x: time_to_minutes(x) if pd.notna(x) else np.nan
+    ).fillna(1439).astype(int)
+    mask_invalida = opt["tw_start_original"] > opt["tw_end_original"]
+    opt.loc[mask_invalida, ["tw_start_original", "tw_end_original"]] = [0, 1439]
+
+    opt["tw_start"] = opt["tw_start_original"]
+    opt["tw_end"] = opt["tw_end_original"]
+
+    tipo_map = (
+        dicruta.set_index("ruta")["tipo_ruta"].astype(str).str.strip().str.upper().to_dict()
+        if dicruta is not None and "tipo_ruta" in dicruta.columns
+        else {}
+    )
+    opt["tipo_ruta_original"] = (
+        opt["ruta_original"].map(tipo_map).fillna("SIN INFORMACIÓN").astype(str).str.strip().str.upper()
+    )
+    opt["minuto_gestion_real"] = (
+        pd.to_datetime(opt["datetime_gestion"], errors="coerce").dt.hour.fillna(99).astype(int) * 60
+        + pd.to_datetime(opt["datetime_gestion"], errors="coerce").dt.minute.fillna(0).astype(int)
+    )
+    opt["es_reserva_anclada_sl5_am"] = (
+        opt["tipo_ruta_original"].eq(TIPO_RUTA_ANCLAJE_AM)
+        & (opt["minuto_gestion_real"] < HORA_CORTE_ANCLAJE_AM_MIN)
+    )
+    opt["vehiculo_obligatorio"] = np.where(
+        opt["es_reserva_anclada_sl5_am"], opt["ruta_original"], ""
+    )
+    opt["bloque_obligatorio"] = np.where(
+        opt["es_reserva_anclada_sl5_am"], "AM", ""
+    )
+
+    # Las reservas SL5 MALL gestionadas antes de las 13:00 se mantienen en su
+    # ruta AM original. Para ellas se relaja la ventana de la reserva durante
+    # la resolución; después se compara la ETA con la ventana original y se
+    # marca explícitamente como fuera de horario cuando corresponda.
+    mask_anclada = opt["es_reserva_anclada_sl5_am"]
+    opt.loc[mask_anclada, "tw_start"] = BLOQUE_AM_START_MIN
+    opt.loc[mask_anclada, "tw_end"] = max(BLOQUE_AM_START_MIN, HORA_CORTE_ANCLAJE_AM_MIN - 1)
+    opt["factor_escala_capacidad"] = 1.0
     return opt.reset_index(drop=True)
 
 
-def evaluar_compatibilidad_reserva_ruta(reserva, ruta, capacidad_disponible=None, reservas_disponibles=None, eta_min=None, fin_estimado=None):
-    motivos=[]
-    vol=float(reserva.get("volumen",0) or 0); bt_res=float(reserva.get("q_os_B",0) or 0)
-    vmin=ruta.get("vol_min",np.nan); vmax=ruta.get("vol_max",np.nan); bt=ruta.get("bt",np.nan)
-    if pd.notna(vmin) and vol < float(vmin)-1e-9: motivos.append("fuera del rango de volumen: menor a Vol-min")
-    if pd.notna(vmax) and vol > float(vmax)+1e-9: motivos.append("fuera del rango de volumen: mayor a Vol-max")
-    if pd.notna(bt):
-        bt=float(bt)
-        if bt==0 and bt_res>0: motivos.append("no cumple restricción BT: la ruta no admite Big Ticket")
-        elif bt>=1 and not (bt_res==0 or bt_res>=bt): motivos.append(f"no cumple restricción BT: requiere 0 o al menos {int(bt)} Big Ticket")
-    if capacidad_disponible is not None and vol>float(capacidad_disponible)+1e-9: motivos.append("supera la capacidad disponible")
-    if reservas_disponibles is not None and float(reservas_disponibles)<1: motivos.append("no existe cupo de reservas")
-    hmin=ruta.get("hora_min_minutos",np.nan); hmax=ruta.get("hora_max_minutos",np.nan)
-    if eta_min is not None:
-        if pd.notna(hmin) and eta_min < int(hmin): motivos.append("incompatibilidad horaria: inicio anterior a Hora-min")
-        if pd.notna(hmax) and eta_min > int(hmax): motivos.append("incompatibilidad horaria: llegada posterior a Hora-max")
-        if eta_min < int(reserva.get("tw_start",0)) or eta_min > int(reserva.get("tw_end",1439)): motivos.append("ventana horaria imposible")
-    if fin_estimado is not None and pd.notna(hmax) and fin_estimado>int(hmax): motivos.append("incompatibilidad horaria: término posterior a Hora-max")
-    return {"compatible":len(motivos)==0,"motivos":motivos}
+def _cumple_ventana_original(reserva, eta_min):
+    inicio = int(reserva.get("tw_start_original", reserva.get("tw_start", 0)))
+    fin = int(reserva.get("tw_end_original", reserva.get("tw_end", 1439)))
+    return inicio <= int(eta_min) <= fin
 
+
+def evaluar_compatibilidad_reserva_ruta(reserva, ruta, capacidad_disponible=None, reservas_disponibles=None, eta_min=None, fin_estimado=None):
+    motivos = []
+    vol = float(reserva.get("volumen", 0) or 0)
+    bt_res = float(reserva.get("q_os_B", 0) or 0)
+    es_anclada = bool(reserva.get("es_reserva_anclada_sl5_am", False))
+
+    if es_anclada:
+        vehiculo_eval = ruta.get("vehiculo_base")
+        bloque_eval = ruta.get("bloque")
+        obligatorio = str(reserva.get("vehiculo_obligatorio", "")).strip()
+        if vehiculo_eval is not None and str(vehiculo_eval).strip() != obligatorio:
+            motivos.append(f"reserva SL5 MALL AM obligatoria para la ruta {obligatorio}")
+        if bloque_eval is not None and str(bloque_eval).strip().upper() != "AM":
+            motivos.append("reserva SL5 MALL AM obligatoria para el bloque AM")
+        # Para la demanda histórica anclada se omiten Vol-min, Vol-max y BT.
+        # Esas restricciones siguen aplicando normalmente a cualquier reserva
+        # adicional que el optimizador quiera incorporar a la ruta SL5 MALL.
+    else:
+        vmin = ruta.get("vol_min", np.nan)
+        vmax = ruta.get("vol_max", np.nan)
+        bt = ruta.get("bt", np.nan)
+        if pd.notna(vmin) and vol < float(vmin) - 1e-9:
+            motivos.append("fuera del rango de volumen: menor a Vol-min")
+        if pd.notna(vmax) and vol > float(vmax) + 1e-9:
+            motivos.append("fuera del rango de volumen: mayor a Vol-max")
+        if pd.notna(bt):
+            bt = float(bt)
+            if bt == 0 and bt_res > 0:
+                motivos.append("no cumple restricción BT: la ruta no admite Big Ticket")
+            elif bt >= 1 and not (bt_res == 0 or bt_res >= bt):
+                motivos.append(f"no cumple restricción BT: requiere 0 o al menos {int(bt)} Big Ticket")
+
+    if capacidad_disponible is not None and vol > float(capacidad_disponible) + 1e-9:
+        motivos.append("supera la capacidad disponible")
+    if reservas_disponibles is not None and float(reservas_disponibles) < 1:
+        motivos.append("no existe cupo de reservas")
+
+    hmin = ruta.get("hora_min_minutos", np.nan)
+    hmax = ruta.get("hora_max_minutos", np.nan)
+    if eta_min is not None:
+        if pd.notna(hmin) and eta_min < int(hmin):
+            motivos.append("incompatibilidad horaria: inicio anterior a Hora-min")
+        if pd.notna(hmax) and eta_min > int(hmax):
+            motivos.append("incompatibilidad horaria: llegada posterior a Hora-max")
+        if eta_min < int(reserva.get("tw_start", 0)) or eta_min > int(reserva.get("tw_end", 1439)):
+            motivos.append("ventana horaria imposible")
+    if fin_estimado is not None and pd.notna(hmax) and fin_estimado > int(hmax):
+        motivos.append("incompatibilidad horaria: término posterior a Hora-max")
+    return {"compatible": len(motivos) == 0, "motivos": motivos}
 
 def construir_flotas_baseline(baseline,dicruta):
     rutas=sorted(baseline["ruta"].dropna().unique()); cfg=dicruta.set_index("ruta").to_dict("index")
@@ -1024,14 +1158,32 @@ def construir_flotas_baseline(baseline,dicruta):
 
 
 def _construir_vehiculos_v18(flota):
-    vehs=[]
-    for _,r in flota.iterrows():
-        hmin=int(r["hora_min_minutos"]) if pd.notna(r.get("hora_min_minutos",np.nan)) else None
-        hmax=int(r["hora_max_minutos"]) if pd.notna(r.get("hora_max_minutos",np.nan)) else None
-        for bloque,vuelta,bstart,bend in [("AM",1,BLOQUE_AM_START_MIN,BLOQUE_AM_END_MIN),("PM",2,BLOQUE_PM_START_MIN,BLOQUE_PM_END_MIN)]:
-            s=max(bstart,hmin) if hmin is not None else bstart; e=min(bend,hmax) if hmax is not None else bend
-            if s>=e or e-s<1: continue
-            x=r.to_dict(); x.update({"vuelta_slot":vuelta,"bloque":bloque,"slot_start":int(s),"slot_end":int(e)})
+    vehs = []
+    for _, r in flota.iterrows():
+        hmin = int(r["hora_min_minutos"]) if pd.notna(r.get("hora_min_minutos", np.nan)) else None
+        hmax = int(r["hora_max_minutos"]) if pd.notna(r.get("hora_max_minutos", np.nan)) else None
+        for bloque, vuelta, bstart, bend in [
+            ("AM", 1, BLOQUE_AM_START_MIN, BLOQUE_AM_END_MIN),
+            ("PM", 2, BLOQUE_PM_START_MIN, BLOQUE_PM_END_MIN)
+        ]:
+            s = max(bstart, hmin) if hmin is not None else bstart
+            e = min(bend, hmax) if hmax is not None else bend
+            if s >= e or e - s < 1:
+                continue
+            x = r.to_dict()
+            x["capacidad_diccionario"] = float(r.get("capacidad", DEFAULT_CAPACIDAD))
+            if bloque == "AM":
+                carga_obligatoria = float(r.get("carga_sl5_am_obligatoria_m3", 0) or 0)
+                reservas_obligatorias = int(r.get("reservas_sl5_am_obligatorias", 0) or 0)
+                x["capacidad"] = max(float(r.get("capacidad", DEFAULT_CAPACIDAD)), carga_obligatoria)
+                if pd.notna(r.get("resv_max", np.nan)):
+                    x["resv_max"] = max(int(r["resv_max"]), reservas_obligatorias)
+            x.update({
+                "vuelta_slot": vuelta,
+                "bloque": bloque,
+                "slot_start": int(s),
+                "slot_end": int(e)
+            })
             vehs.append(x)
     return pd.DataFrame(vehs)
 
@@ -1044,7 +1196,21 @@ def _diagnosticar_no_asignada(p, vehiculos, motivos_extra=None):
         else: motivos.extend(ev["motivos"])
     if not rutas_eval: motivos.append("no existe una ruta compatible")
     if rutas_eval and compatibles==0 and not motivos: motivos.append("no existe una ruta compatible")
-    return {"reserva":p.get("id_punto_opt",""),"ruta_original":p.get("ruta_original",""),"volumen":p.get("volumen",0),"q_os":p.get("os",0),"q_os_B":p.get("q_os_B",0),"ventana_horaria":f"{minutes_to_time(p.get('tw_start',0))}-{minutes_to_time(p.get('tw_end',1439))}","motivos":"; ".join(sorted(set(motivos))) or "no existe una ruta compatible","rutas_evaluadas":", ".join(sorted(set(rutas_eval))),"cantidad_rutas_compatibles_encontradas":compatibles}
+    if bool(p.get("es_reserva_anclada_sl5_am", False)):
+        motivos.append(f"reserva obligatoria SL5 MALL AM para {p.get('vehiculo_obligatorio', p.get('ruta_original', ''))}")
+    return {
+        "reserva": p.get("id_punto_opt", ""),
+        "direccion": p.get("direccion", "SIN DIRECCIÓN"),
+        "ruta_original": p.get("ruta_original", ""),
+        "volumen": p.get("volumen", 0),
+        "q_os": p.get("os", 0),
+        "q_os_B": p.get("q_os_B", 0),
+        "ventana_horaria": f"{minutes_to_time(p.get('tw_start_original', p.get('tw_start', 0)))}-{minutes_to_time(p.get('tw_end_original', p.get('tw_end', 1439)))}",
+        "es_reserva_anclada_sl5_am": bool(p.get("es_reserva_anclada_sl5_am", False)),
+        "motivos": "; ".join(sorted(set(motivos))) or "no existe una ruta compatible",
+        "rutas_evaluadas": ", ".join(sorted(set(rutas_eval))),
+        "cantidad_rutas_compatibles_encontradas": compatibles
+    }
 
 
 
@@ -1070,24 +1236,22 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
         return int(matrix[f][t]+(service[f] if f else 0))
     transit=routing.RegisterTransitCallback(time_cb); routing.SetArcCostEvaluatorOfAllVehicles(transit)
 
-    # Costo fijo por vehículo abierto: objetivo explícito de consolidación.
-    # Cada vehículo/vuelta que el solver activa paga este costo fijo además
-    # del tiempo de viaje. Esto empuja al solver a preferir MENOS vehículos
-    # con mayor ocupación en vez de repartir poca carga en muchas rutas,
-    # que era el comportamiento anterior (solo minimizaba tiempo de viaje).
-    for v in range(len(vehiculos)):
-        routing.SetFixedCostOfVehicle(COSTO_FIJO_VEHICULO_ABIERTO, int(v))
-
-    # Prioridad suave de tipos de ruta: abrir una ruta NO priorizada suma un
-    # costo fijo adicional por encima del costo base de consolidación.
-    # Las rutas no priorizadas siguen disponibles cuando son necesarias.
-    if "es_tipo_priorizado" in vehiculos.columns and vehiculos["es_tipo_priorizado"].any():
-        for v,row in vehiculos.iterrows():
-            if not bool(row.get("es_tipo_priorizado",False)):
-                routing.SetFixedCostOfVehicle(
-                    COSTO_FIJO_VEHICULO_ABIERTO + PENALIZACION_RUTA_NO_PRIORIZADA,
-                    int(v)
-                )
+    # Costo fijo y jerarquía de prioridades. Prioridad 1 no recibe recargo;
+    # prioridad 2 paga un nivel; prioridad 3 paga dos niveles, etc. Las rutas
+    # no seleccionadas quedan después de todos los niveles definidos.
+    niveles = int(vehiculos.get("cantidad_niveles_prioridad", pd.Series([0])).max())
+    for v, row in vehiculos.iterrows():
+        if niveles > 0:
+            prioridad = int(row.get("prioridad_tipo_ruta", niveles + 1))
+            if bool(row.get("es_tipo_priorizado", False)):
+                recargo = max(0, prioridad - 1) * PENALIZACION_POR_NIVEL_PRIORIDAD
+            else:
+                recargo = niveles * PENALIZACION_POR_NIVEL_PRIORIDAD + PENALIZACION_RUTA_NO_PRIORIZADA
+        else:
+            recargo = 0
+        routing.SetFixedCostOfVehicle(
+            COSTO_FIJO_VEHICULO_ABIERTO + int(recargo), int(v)
+        )
 
     routing.AddDimension(transit,30,1440,False,"Time"); td=routing.GetDimensionOrDie("Time")
     for n,p in enumerate(puntos.to_dict("records"),1):
@@ -1123,9 +1287,11 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
             if v_int not in allowed_set:
                 vehicle_var.RemoveValue(v_int)
 
-        # Permite descartar nodos imposibles con una penalización alta; se
-        # reportan como no asignados y nunca como una ruta ficticia.
-        routing.AddDisjunction([idx],10_000_000)
+        # Las reservas SL5 MALL AM son obligatorias: no se les agrega
+        # disyunción, por lo que deben quedar en su ruta original AM.
+        # El resto puede descartarse con penalización alta y se reporta.
+        if not bool(p.get("es_reserva_anclada_sl5_am", False)):
+            routing.AddDisjunction([idx], 10_000_000)
     params=pywrapcp.DefaultRoutingSearchParameters(); params.first_solution_strategy=routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
     params.local_search_metaheuristic=routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH; params.time_limit.seconds=max(1, ORTOOLS_TIME_LIMIT_SECONDS)
     sol=routing.SolveWithParameters(params)
@@ -1136,7 +1302,17 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
         while not routing.IsEnd(idx):
             n=manager.IndexToNode(idx)
             if n:
-                p=puntos.iloc[n-1].to_dict(); asignados.add(n-1); stops.append({"p":p,"eta_min":sol.Value(td.CumulVar(idx)),"cumple_vh":True,"compatible":True,"motivos":""})
+                p = puntos.iloc[n-1].to_dict()
+                eta_val = sol.Value(td.CumulVar(idx))
+                asignados.add(n-1)
+                cumple_original = _cumple_ventana_original(p, eta_val)
+                stops.append({
+                    "p": p,
+                    "eta_min": eta_val,
+                    "cumple_vh": cumple_original,
+                    "compatible": True,
+                    "motivos": "" if cumple_original else "fuera de ventana horaria original"
+                })
             idx=sol.Value(routing.NextVar(idx))
         if stops: asign.append({"vehiculo":vehiculos.iloc[v].to_dict(),"stops":stops,"fin_min":sol.Value(td.CumulVar(idx))})
     dropped=[puntos.iloc[i].to_dict() for i in range(len(puntos)) if i not in asignados]
@@ -1171,7 +1347,17 @@ def optimizar_cached(puntos,flota,escenario,usar_osrm_matrix=True,usar_osrm_geom
                 if fin>int(v["slot_end"]): ev["motivos"].append("incompatibilidad horaria: excede bloque operativo"); ev["compatible"]=False
                 if ev["compatible"]: candidatos.append((int(p["tw_end"]),viaje,-float(p["volumen"]),i,eta,serv))
             if not candidatos: break
-            *_,idx,eta,serv=min(candidatos); p=pendientes.pop(idx); stops.append({"p":p,"eta_min":eta,"cumple_vh":True,"compatible":True,"motivos":""}); cap-=float(p["volumen"]); cupo-=1; t=eta+serv; pos=(float(p["lat"]),float(p["lon"]))
+            *_, idx, eta, serv = min(candidatos)
+            p = pendientes.pop(idx)
+            cumple_original = _cumple_ventana_original(p, eta)
+            stops.append({
+                "p": p,
+                "eta_min": eta,
+                "cumple_vh": cumple_original,
+                "compatible": True,
+                "motivos": "" if cumple_original else "fuera de ventana horaria original"
+            })
+            cap -= float(p["volumen"]); cupo -= 1; t = eta + serv; pos = (float(p["lat"]), float(p["lon"]))
         if stops: asignaciones.append({"vehiculo":v.to_dict(),"stops":stops,"fin_min":t+travel(pos,HUB_COORD)})
     noas=pd.DataFrame([_diagnosticar_no_asignada(p,vehiculos,["no fue posible asignar con la capacidad, cupos y horarios remanentes"]) for p in pendientes])
     routes=[]; details=[]
@@ -1180,7 +1366,42 @@ def optimizar_cached(puntos,flota,escenario,usar_osrm_matrix=True,usar_osrm_geom
         out=[]
         for seq,it in enumerate(a["stops"],1):
             p=it["p"]; total_os+=p["os"]; total_vol+=p["volumen"]; total_k+=p["kilo_mayor"]; total_bt+=p.get("q_os_B",0); coords.append((p["lat"],p["lon"]))
-            row={"escenario":escenario,"id_ruta_optimizada":rid,"vehiculo_base":v["vehiculo_base"],"vuelta":v["vuelta_slot"],"bloque":v["bloque"],"secuencia":seq,"id_punto_opt":p["id_punto_opt"],"reserva":p["id_punto_opt"],"lat":p["lat"],"lon":p["lon"],"eta":minutes_to_time(it["eta_min"]),"eta_min":it["eta_min"],"tw_start":p["tw_start"],"tw_end":p["tw_end"],"cumple_vh_estimado":True,"compatible":True,"motivos_incompatibilidad":"","os":p["os"],"q_os_B":p.get("q_os_B",0),"volumen":p["volumen"],"volumen_original":p["volumen_original"],"kilo_mayor":p["kilo_mayor"],"m3_por_os_max":p.get("m3_por_os_max",0),"ajuste_vol_usado":p.get("ajuste_vol_usado",0.33),"volumen_ajustado":p.get("volumen_ajustado",False),"ruta_real_original":p["ruta_original"],"vuelta_real_original":p["vuelta_original"]}
+            cumple_original = bool(it.get("cumple_vh", _cumple_ventana_original(p, it["eta_min"])))
+            row = {
+                "escenario": escenario,
+                "id_ruta_optimizada": rid,
+                "vehiculo_base": v["vehiculo_base"],
+                "ruta": v["vehiculo_base"],
+                "vuelta": v["vuelta_slot"],
+                "bloque": v["bloque"],
+                "secuencia": seq,
+                "id_punto_opt": p["id_punto_opt"],
+                "reserva": p["id_punto_opt"],
+                "direccion": p.get("direccion", "SIN DIRECCIÓN"),
+                "lat": p["lat"],
+                "lon": p["lon"],
+                "eta": minutes_to_time(it["eta_min"]),
+                "eta_min": it["eta_min"],
+                "tw_start": p.get("tw_start_original", p["tw_start"]),
+                "tw_end": p.get("tw_end_original", p["tw_end"]),
+                "ventana_horaria_original": f"{minutes_to_time(p.get('tw_start_original', p['tw_start']))}-{minutes_to_time(p.get('tw_end_original', p['tw_end']))}",
+                "cumple_vh_estimado": cumple_original,
+                "estado_horario": "Cumple" if cumple_original else "Fuera de horario",
+                "compatible": True,
+                "motivos_incompatibilidad": it.get("motivos", ""),
+                "es_reserva_anclada_sl5_am": bool(p.get("es_reserva_anclada_sl5_am", False)),
+                "vehiculo_obligatorio": p.get("vehiculo_obligatorio", ""),
+                "os": p["os"],
+                "q_os_B": p.get("q_os_B", 0),
+                "volumen": p["volumen"],
+                "volumen_original": p["volumen_original"],
+                "kilo_mayor": p["kilo_mayor"],
+                "m3_por_os_max": p.get("m3_por_os_max", 0),
+                "ajuste_vol_usado": p.get("ajuste_vol_usado", 0.33),
+                "volumen_ajustado": p.get("volumen_ajustado", False),
+                "ruta_real_original": p["ruta_original"],
+                "vuelta_real_original": p["vuelta_original"]
+            }
             out.append(row); details.append(row)
         coords.append(HUB_COORD); geom,ok,km=get_route_geometry(tuple(coords),usar_osrm=usar_osrm_geometry)
         routes.append({"escenario":escenario,"id_ruta_optimizada":rid,"vehiculo_base":v["vehiculo_base"],"vuelta":v["vuelta_slot"],"bloque":v["bloque"],"capacidad":v["capacidad"],"resv_max":v.get("resv_max",np.nan),"bt":v.get("bt",np.nan),"factor_ocupacion":total_vol/v["capacidad"]*100,"color":color_from_text(f"{escenario}-{rid}"),"geometry":geom,"geometry_ok":ok,"stops":out,"total_os":total_os,"total_q_os_B":total_bt,"volumen":total_vol,"kilo_mayor":total_k,"paradas":len(out),"reservas":len(out),"km_estimado":km,"inicio_ruta":minutes_to_time(v["slot_start"]),"fin_ruta":minutes_to_time(a["fin_min"]),"tiempo_ruta_min":a["fin_min"]-v["slot_start"],"activo":True,"factible":True})
@@ -1257,22 +1478,40 @@ tipos_ruta_dic = sorted([
 with st.sidebar:
     st.markdown("---")
     st.subheader("Prioridad de rutas")
-    tipos_ruta_priorizados = st.multiselect(
+    tipos_ruta_seleccionados = st.multiselect(
         "Tipos de ruta a priorizar",
         options=tipos_ruta_dic,
         default=[],
         help=(
-            "El optimizador intentará asignar carga primero a estos tipos de ruta, "
-            "siempre que cumplan capacidad, volumen, BT, cupos y horarios. "
-            "Si no son suficientes, utilizará los demás tipos disponibles."
+            "Selecciona los tipos y luego ordénalos. La prioridad 1 será la más "
+            "preferida; las siguientes se utilizarán en orden cuando sean necesarias."
         ),
-        key="tipos_ruta_priorizados"
+        key="tipos_ruta_priorizados_seleccion"
     )
-    if tipos_ruta_priorizados:
-        st.caption(
-            "Prioridad activa: " + ", ".join(tipos_ruta_priorizados)
-        )
+
+    orden_key = "orden_jerarquico_tipos_ruta"
+    orden_previo = st.session_state.get(orden_key, [])
+    orden_actual = [x for x in orden_previo if x in tipos_ruta_seleccionados]
+    orden_actual += [x for x in tipos_ruta_seleccionados if x not in orden_actual]
+    st.session_state[orden_key] = orden_actual
+
+    if orden_actual:
+        st.caption("Ordena la jerarquía. 1 = mayor prioridad.")
+        for i, tipo in enumerate(list(orden_actual)):
+            c_txt, c_up, c_down = st.columns([5, 1, 1])
+            c_txt.markdown(f"**{i + 1}. {tipo}**")
+            if c_up.button("↑", key=f"prioridad_up_{hashlib.md5(tipo.encode()).hexdigest()[:8]}", disabled=i == 0):
+                orden_actual[i - 1], orden_actual[i] = orden_actual[i], orden_actual[i - 1]
+                st.session_state[orden_key] = orden_actual
+                st.rerun()
+            if c_down.button("↓", key=f"prioridad_down_{hashlib.md5(tipo.encode()).hexdigest()[:8]}", disabled=i == len(orden_actual) - 1):
+                orden_actual[i + 1], orden_actual[i] = orden_actual[i], orden_actual[i + 1]
+                st.session_state[orden_key] = orden_actual
+                st.rerun()
+        tipos_ruta_priorizados = list(st.session_state[orden_key])
+        st.caption("Jerarquía activa: " + " > ".join(tipos_ruta_priorizados))
     else:
+        tipos_ruta_priorizados = []
         st.caption("Sin prioridad: se mantiene la lógica normal por capacidad y tiempo.")
 
 
@@ -1592,6 +1831,27 @@ def ejecutar_escenarios_dia(
         .astype(bool)
     )
 
+    tipo_dic_map = (
+        dicruta.set_index("ruta")["tipo_ruta"].astype(str).str.strip().str.upper().to_dict()
+        if "tipo_ruta" in dicruta.columns else {}
+    )
+    baseline_completo["tipo_ruta_diccionario"] = (
+        baseline_completo["ruta"].map(tipo_dic_map).fillna("SIN INFORMACIÓN")
+    )
+    minuto_gestion = (
+        baseline_completo["datetime_gestion"].dt.hour.fillna(99).astype(int) * 60
+        + baseline_completo["datetime_gestion"].dt.minute.fillna(0).astype(int)
+    )
+    baseline_completo["es_reserva_anclada_sl5_am"] = (
+        baseline_completo["tipo_ruta_diccionario"].eq(TIPO_RUTA_ANCLAJE_AM)
+        & (minuto_gestion < HORA_CORTE_ANCLAJE_AM_MIN)
+    )
+    rutas_sl5_am_obligatorias = sorted(
+        baseline_completo.loc[
+            baseline_completo["es_reserva_anclada_sl5_am"], "ruta"
+        ].dropna().unique()
+    )
+
     rutas_propias_dia = sorted(
         baseline_completo.loc[
             baseline_completo["es_ruta_propia"],
@@ -1606,6 +1866,13 @@ def ejecutar_escenarios_dia(
         baseline_cap = baseline_completo[
             ~baseline_completo["es_ruta_propia"]
         ].copy()
+        # Las reservas históricas SL5 MALL AM son obligatorias incluso si la
+        # ruta estuviera marcada como propia y no se habilitó el resto de su demanda.
+        sl5_obligatorias = baseline_completo[
+            baseline_completo["es_reserva_anclada_sl5_am"]
+        ].copy()
+        baseline_cap = pd.concat([baseline_cap, sl5_obligatorias], ignore_index=True)
+        baseline_cap = baseline_cap.drop_duplicates()
 
     # Flota real completa del día.
     flota_bl_completa = construir_flotas_baseline(
@@ -1640,6 +1907,16 @@ def ejecutar_escenarios_dia(
             .drop_duplicates("vehiculo_base")
         )
 
+    # La flota original de las reservas SL5 MALL AM siempre debe estar
+    # disponible para poder cumplir el anclaje obligatorio.
+    if rutas_sl5_am_obligatorias:
+        flota_sl5_obligatoria = flota_bl_completa[
+            flota_bl_completa["vehiculo_base"].isin(rutas_sl5_am_obligatorias)
+        ].copy()
+        flota_cap_base = pd.concat(
+            [flota_cap_base, flota_sl5_obligatoria], ignore_index=True
+        ).drop_duplicates("vehiculo_base")
+
     max_capacidad_disponible = (
         float(flota_cap_base["capacidad"].max())
         if not flota_cap_base.empty
@@ -1660,6 +1937,28 @@ def ejecutar_escenarios_dia(
         else 0,
         tipos_ruta_priorizados=tipos_ruta_priorizados
     )
+
+    # Reserva capacidad y cupos mínimos para la carga histórica obligatoria
+    # SL5 MALL AM. Si el histórico supera el límite del diccionario, la
+    # capacidad efectiva AM se eleva solo hasta cubrir esa carga obligatoria;
+    # no se genera capacidad adicional para sumar otras reservas.
+    if not puntos_cap.empty and "es_reserva_anclada_sl5_am" in puntos_cap.columns:
+        obligatorias = puntos_cap[puntos_cap["es_reserva_anclada_sl5_am"]].copy()
+        if not obligatorias.empty:
+            carga_obligatoria = obligatorias.groupby("vehiculo_obligatorio")["volumen"].sum().to_dict()
+            cantidad_obligatoria = obligatorias.groupby("vehiculo_obligatorio")["id_punto_opt"].nunique().to_dict()
+            flota_cap["carga_sl5_am_obligatoria_m3"] = (
+                flota_cap["vehiculo_base"].map(carga_obligatoria).fillna(0)
+            )
+            flota_cap["reservas_sl5_am_obligatorias"] = (
+                flota_cap["vehiculo_base"].map(cantidad_obligatoria).fillna(0).astype(int)
+            )
+        else:
+            flota_cap["carga_sl5_am_obligatoria_m3"] = 0.0
+            flota_cap["reservas_sl5_am_obligatorias"] = 0
+    else:
+        flota_cap["carga_sl5_am_obligatoria_m3"] = 0.0
+        flota_cap["reservas_sl5_am_obligatorias"] = 0
 
     routes_cap, detail_cap, resumen_cap, meta_cap = optimizar_cached(
         puntos_cap,
