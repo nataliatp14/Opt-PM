@@ -72,6 +72,11 @@ OSRM_MAX_MATRIX_POINTS = int(os.getenv("OSRM_MAX_MATRIX_POINTS", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
 PENALIZACION_RUTA_NO_PRIORIZADA = int(os.getenv("PENALIZACION_RUTA_NO_PRIORIZADA", "5000"))
 PENALIZACION_POR_NIVEL_PRIORIDAD = int(os.getenv("PENALIZACION_POR_NIVEL_PRIORIDAD", "5000"))
+# Penalización aplicada por CADA reserva asignada a una ruta de menor jerarquía.
+# La versión anterior solo penalizaba abrir el vehículo; una vez abierto, podía
+# absorber carga sin costo adicional y la prioridad dejaba de notarse.
+PENALIZACION_ASIGNACION_POR_NIVEL = int(os.getenv("PENALIZACION_ASIGNACION_POR_NIVEL", "1200"))
+PENALIZACION_ASIGNACION_NO_PRIORIZADA = int(os.getenv("PENALIZACION_ASIGNACION_NO_PRIORIZADA", "1800"))
 TIPO_RUTA_ANCLAJE_AM = os.getenv("TIPO_RUTA_ANCLAJE_AM", "SL5 MALL").strip().upper()
 HORA_CORTE_ANCLAJE_AM_MIN = int(os.getenv("HORA_CORTE_ANCLAJE_AM_MIN", str(13 * 60)))
 # Costo fijo que paga el solver por cada vehículo/vuelta que decide abrir.
@@ -761,7 +766,7 @@ def render_map(stops, paths, title, key_prefix="mapa"):
     )
 
 # ============================================================
-# MOTOR V18 · RESTRICCIONES OPERACIONALES CENTRALIZADAS
+# MOTOR V20 · RESTRICCIONES OPERACIONALES CENTRALIZADAS
 # ============================================================
 # Estas redefiniciones reemplazan el motor anterior sin eliminar la interfaz,
 # mapas, filtros, gráficos ni exportaciones existentes.
@@ -1088,18 +1093,24 @@ def evaluar_compatibilidad_reserva_ruta(reserva, ruta, capacidad_disponible=None
     vol = float(reserva.get("volumen", 0) or 0)
     bt_res = float(reserva.get("q_os_B", 0) or 0)
     es_anclada = bool(reserva.get("es_reserva_anclada_sl5_am", False))
+    es_slot_obligatorio = bool(ruta.get("es_slot_sl5_am_obligatorio", False))
+
+    # El slot especial AM de SL5 MALL queda reservado exclusivamente para la
+    # demanda histórica obligatoria. Así las reservas adicionales no ocupan
+    # el espacio anterior a las 13:00 ni se saltan la configuración del dicruta.
+    if es_slot_obligatorio and not es_anclada:
+        motivos.append("slot AM SL5 MALL reservado para reservas históricas obligatorias")
 
     if es_anclada:
         vehiculo_eval = ruta.get("vehiculo_base")
-        bloque_eval = ruta.get("bloque")
         obligatorio = str(reserva.get("vehiculo_obligatorio", "")).strip()
         if vehiculo_eval is not None and str(vehiculo_eval).strip() != obligatorio:
             motivos.append(f"reserva SL5 MALL AM obligatoria para la ruta {obligatorio}")
-        if bloque_eval is not None and str(bloque_eval).strip().upper() != "AM":
-            motivos.append("reserva SL5 MALL AM obligatoria para el bloque AM")
-        # Para la demanda histórica anclada se omiten Vol-min, Vol-max y BT.
-        # Esas restricciones siguen aplicando normalmente a cualquier reserva
-        # adicional que el optimizador quiera incorporar a la ruta SL5 MALL.
+        if not es_slot_obligatorio:
+            motivos.append("reserva SL5 MALL AM obligatoria para el slot AM histórico")
+        # Para la demanda histórica anclada se omiten Hora-min, Hora-max,
+        # Vol-min, Vol-max y BT. El horario permitido lo controla el slot
+        # especial 06:00-13:00 y luego se compara la ETA con la ventana original.
     else:
         vmin = ruta.get("vol_min", np.nan)
         vmax = ruta.get("vol_max", np.nan)
@@ -1123,13 +1134,17 @@ def evaluar_compatibilidad_reserva_ruta(reserva, ruta, capacidad_disponible=None
     hmin = ruta.get("hora_min_minutos", np.nan)
     hmax = ruta.get("hora_max_minutos", np.nan)
     if eta_min is not None:
-        if pd.notna(hmin) and eta_min < int(hmin):
-            motivos.append("incompatibilidad horaria: inicio anterior a Hora-min")
-        if pd.notna(hmax) and eta_min > int(hmax):
-            motivos.append("incompatibilidad horaria: llegada posterior a Hora-max")
+        # La demanda obligatoria usa el slot histórico especial y no la
+        # Hora-min=13:00 del diccionario. Las reservas adicionales sí respetan
+        # completamente el horario del dicruta.
+        if not es_anclada:
+            if pd.notna(hmin) and eta_min < int(hmin):
+                motivos.append("incompatibilidad horaria: inicio anterior a Hora-min")
+            if pd.notna(hmax) and eta_min > int(hmax):
+                motivos.append("incompatibilidad horaria: llegada posterior a Hora-max")
         if eta_min < int(reserva.get("tw_start", 0)) or eta_min > int(reserva.get("tw_end", 1439)):
             motivos.append("ventana horaria imposible")
-    if fin_estimado is not None and pd.notna(hmax) and fin_estimado > int(hmax):
+    if fin_estimado is not None and not es_anclada and pd.notna(hmax) and fin_estimado > int(hmax):
         motivos.append("incompatibilidad horaria: término posterior a Hora-max")
     return {"compatible": len(motivos) == 0, "motivos": motivos}
 
@@ -1158,31 +1173,67 @@ def construir_flotas_baseline(baseline,dicruta):
 
 
 def _construir_vehiculos_v18(flota):
+    """Construye slots de vehículo sin cruzar la regla especial SL5 MALL.
+
+    Para cada SL5 MALL con reservas históricas gestionadas antes de las 13:00:
+    - crea un slot especial 06:00-13:00, exclusivo para esas reservas;
+    - ignora Hora-min/Hora-max del diccionario solo para dicha carga histórica;
+    - conserva un slot PM normal desde las 13:00 para demanda adicional, la
+      cual sí debe cumplir todas las restricciones del diccionario.
+    """
     vehs = []
     for _, r in flota.iterrows():
         hmin = int(r["hora_min_minutos"]) if pd.notna(r.get("hora_min_minutos", np.nan)) else None
         hmax = int(r["hora_max_minutos"]) if pd.notna(r.get("hora_max_minutos", np.nan)) else None
-        for bloque, vuelta, bstart, bend in [
-            ("AM", 1, BLOQUE_AM_START_MIN, BLOQUE_AM_END_MIN),
-            ("PM", 2, BLOQUE_PM_START_MIN, BLOQUE_PM_END_MIN)
-        ]:
+        tipo_norm = str(r.get("tipo_ruta", "")).strip().upper()
+        es_sl5_mall = tipo_norm == TIPO_RUTA_ANCLAJE_AM
+        carga_obligatoria = float(r.get("carga_sl5_am_obligatoria_m3", 0) or 0)
+        reservas_obligatorias = int(r.get("reservas_sl5_am_obligatorias", 0) or 0)
+
+        # Slot histórico obligatorio. Se crea antes que los slots normales para
+        # que también la heurística de respaldo procese primero esta carga.
+        if es_sl5_mall and reservas_obligatorias > 0:
+            x = r.to_dict()
+            x["capacidad_diccionario"] = float(r.get("capacidad", DEFAULT_CAPACIDAD))
+            x["capacidad"] = max(float(r.get("capacidad", DEFAULT_CAPACIDAD)), carga_obligatoria)
+            if pd.notna(r.get("resv_max", np.nan)):
+                x["resv_max"] = max(int(r["resv_max"]), reservas_obligatorias)
+            x.update({
+                "vuelta_slot": 1,
+                "bloque": "AM",
+                "slot_start": int(BLOQUE_AM_START_MIN),
+                "slot_end": int(HORA_CORTE_ANCLAJE_AM_MIN),
+                "es_slot_sl5_am_obligatorio": True,
+                "solo_reservas_ancladas_sl5_am": True
+            })
+            vehs.append(x)
+
+        # Para SL5 MALL, la disponibilidad normal comienza a las 13:00. No se
+        # crea el antiguo slot AM 13:00-15:00, que se superponía con el PM.
+        if es_sl5_mall:
+            bloques = [
+                ("PM", 2, max(BLOQUE_PM_START_MIN, HORA_CORTE_ANCLAJE_AM_MIN), BLOQUE_PM_END_MIN)
+            ]
+        else:
+            bloques = [
+                ("AM", 1, BLOQUE_AM_START_MIN, BLOQUE_AM_END_MIN),
+                ("PM", 2, BLOQUE_PM_START_MIN, BLOQUE_PM_END_MIN)
+            ]
+
+        for bloque, vuelta, bstart, bend in bloques:
             s = max(bstart, hmin) if hmin is not None else bstart
             e = min(bend, hmax) if hmax is not None else bend
             if s >= e or e - s < 1:
                 continue
             x = r.to_dict()
             x["capacidad_diccionario"] = float(r.get("capacidad", DEFAULT_CAPACIDAD))
-            if bloque == "AM":
-                carga_obligatoria = float(r.get("carga_sl5_am_obligatoria_m3", 0) or 0)
-                reservas_obligatorias = int(r.get("reservas_sl5_am_obligatorias", 0) or 0)
-                x["capacidad"] = max(float(r.get("capacidad", DEFAULT_CAPACIDAD)), carga_obligatoria)
-                if pd.notna(r.get("resv_max", np.nan)):
-                    x["resv_max"] = max(int(r["resv_max"]), reservas_obligatorias)
             x.update({
                 "vuelta_slot": vuelta,
                 "bloque": bloque,
                 "slot_start": int(s),
-                "slot_end": int(e)
+                "slot_end": int(e),
+                "es_slot_sl5_am_obligatorio": False,
+                "solo_reservas_ancladas_sl5_am": False
             })
             vehs.append(x)
     return pd.DataFrame(vehs)
@@ -1234,24 +1285,68 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
     def time_cb(fi,ti):
         f=manager.IndexToNode(fi); t=manager.IndexToNode(ti)
         return int(matrix[f][t]+(service[f] if f else 0))
-    transit=routing.RegisterTransitCallback(time_cb); routing.SetArcCostEvaluatorOfAllVehicles(transit)
+    # La dimensión de tiempo siempre usa tiempo real, sin penalizaciones de
+    # prioridad. Los costos de selección se aplican en callbacks separados.
+    transit=routing.RegisterTransitCallback(time_cb)
 
-    # Costo fijo y jerarquía de prioridades. Prioridad 1 no recibe recargo;
-    # prioridad 2 paga un nivel; prioridad 3 paga dos niveles, etc. Las rutas
-    # no seleccionadas quedan después de todos los niveles definidos.
+    # Prioridad reforzada en dos capas:
+    # 1) costo fijo por ABRIR una ruta de menor jerarquía;
+    # 2) costo por CADA RESERVA asignada a esa ruta.
+    # Esto evita el defecto anterior: si una ruta no priorizada ya estaba
+    # abierta por una reserva restringida, podía recibir el resto de la carga
+    # sin ningún costo adicional.
     niveles = int(vehiculos.get("cantidad_niveles_prioridad", pd.Series([0])).max())
+    costos_prioridad_vehiculo = {}
+    callbacks_costo = []  # mantiene vivas las funciones durante la resolución
+
     for v, row in vehiculos.iterrows():
+        prioridad = int(row.get("prioridad_tipo_ruta", niveles + 1 if niveles > 0 else 1))
+        es_priorizada = bool(row.get("es_tipo_priorizado", False))
+
         if niveles > 0:
-            prioridad = int(row.get("prioridad_tipo_ruta", niveles + 1))
-            if bool(row.get("es_tipo_priorizado", False)):
-                recargo = max(0, prioridad - 1) * PENALIZACION_POR_NIVEL_PRIORIDAD
+            if es_priorizada:
+                nivel_recargo = max(0, prioridad - 1)
+                recargo_apertura = nivel_recargo * PENALIZACION_POR_NIVEL_PRIORIDAD
+                recargo_asignacion = nivel_recargo * PENALIZACION_ASIGNACION_POR_NIVEL
             else:
-                recargo = niveles * PENALIZACION_POR_NIVEL_PRIORIDAD + PENALIZACION_RUTA_NO_PRIORIZADA
+                nivel_recargo = niveles
+                recargo_apertura = (
+                    niveles * PENALIZACION_POR_NIVEL_PRIORIDAD
+                    + PENALIZACION_RUTA_NO_PRIORIZADA
+                )
+                recargo_asignacion = (
+                    niveles * PENALIZACION_ASIGNACION_POR_NIVEL
+                    + PENALIZACION_ASIGNACION_NO_PRIORIZADA
+                )
         else:
-            recargo = 0
+            nivel_recargo = 0
+            recargo_apertura = 0
+            recargo_asignacion = 0
+
+        costos_prioridad_vehiculo[int(v)] = {
+            "prioridad": prioridad,
+            "es_priorizada": es_priorizada,
+            "recargo_apertura": int(recargo_apertura),
+            "recargo_asignacion": int(recargo_asignacion),
+        }
+
         routing.SetFixedCostOfVehicle(
-            COSTO_FIJO_VEHICULO_ABIERTO + int(recargo), int(v)
+            COSTO_FIJO_VEHICULO_ABIERTO + int(recargo_apertura), int(v)
         )
+
+        # El recargo se cobra al entrar a cada punto de demanda, pero no al
+        # volver al HUB. El tiempo/distancia siguen formando parte del costo.
+        def cost_cb(fi, ti, penalizacion=int(recargo_asignacion)):
+            f = manager.IndexToNode(fi)
+            t = manager.IndexToNode(ti)
+            costo = int(matrix[f][t] + (service[f] if f else 0))
+            if t != 0:
+                costo += penalizacion
+            return costo
+
+        callbacks_costo.append(cost_cb)
+        cost_idx = routing.RegisterTransitCallback(cost_cb)
+        routing.SetArcCostEvaluatorOfVehicle(cost_idx, int(v))
 
     routing.AddDimension(transit,30,1440,False,"Time"); td=routing.GetDimensionOrDie("Time")
     for n,p in enumerate(puntos.to_dict("records"),1):
@@ -1287,10 +1382,12 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
             if v_int not in allowed_set:
                 vehicle_var.RemoveValue(v_int)
 
-        # Las reservas SL5 MALL AM son obligatorias: no se les agrega
-        # disyunción, por lo que deben quedar en su ruta original AM.
-        # El resto puede descartarse con penalización alta y se reporta.
-        if not bool(p.get("es_reserva_anclada_sl5_am", False)):
+        # Las reservas SL5 MALL AM son obligatorias. Además de no agregarles
+        # disyunción, retiramos explícitamente -1 del dominio de VehicleVar
+        # para impedir que OR-Tools las marque como descartadas.
+        if bool(p.get("es_reserva_anclada_sl5_am", False)):
+            vehicle_var.RemoveValue(-1)
+        else:
             routing.AddDisjunction([idx], 10_000_000)
     params=pywrapcp.DefaultRoutingSearchParameters(); params.first_solution_strategy=routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
     params.local_search_metaheuristic=routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH; params.time_limit.seconds=max(1, ORTOOLS_TIME_LIMIT_SECONDS)
@@ -1322,18 +1419,18 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
 def optimizar_cached(puntos,flota,escenario,usar_osrm_matrix=True,usar_osrm_geometry=True):
     if puntos.empty or flota.empty:
         noas=pd.DataFrame([_diagnosticar_no_asignada(p,{ }.get('x',pd.DataFrame())) for p in puntos.to_dict('records')]) if not puntos.empty else pd.DataFrame()
-        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_puntos_o_flota","modelo":"v18","no_asignadas":noas}
+        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_puntos_o_flota","modelo":"v21","no_asignadas":noas}
     puntos=puntos.reset_index(drop=True).copy(); vehiculos=_construir_vehiculos_v18(flota)
     if vehiculos.empty:
         noas=pd.DataFrame([_diagnosticar_no_asignada(p,vehiculos) for p in puntos.to_dict('records')])
-        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_vehiculos_factibles","modelo":"v18","no_asignadas":noas}
+        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_vehiculos_factibles","modelo":"v21","no_asignadas":noas}
     def travel(a,b): return int(math.ceil(haversine_km(a[0],a[1],b[0],b[1])*1.35/28*60))
     pendientes=puntos.sort_values(["tw_end","tw_start","volumen"],ascending=[True,True,False]).to_dict("records")
     asignaciones=[]
-    modelo="heuristica_v18_restricciones_completas"
+    modelo="heuristica_v21_prioridad_reforzada"
     ort_asig, ort_drop, matrix_source = _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix)
     if ort_asig is not None:
-        asignaciones=ort_asig; pendientes=ort_drop; modelo="ortools_v18_restricciones_completas"
+        asignaciones=ort_asig; pendientes=ort_drop; modelo="ortools_v21_prioridad_reforzada"
     for _,v in (vehiculos.iterrows() if ort_asig is None else []):
         if not pendientes: break
         cap=float(v["capacidad"]); cupo=float(v["resv_max"]) if pd.notna(v.get("resv_max",np.nan)) else math.inf
@@ -1374,6 +1471,9 @@ def optimizar_cached(puntos,flota,escenario,usar_osrm_matrix=True,usar_osrm_geom
                 "ruta": v["vehiculo_base"],
                 "vuelta": v["vuelta_slot"],
                 "bloque": v["bloque"],
+                "tipo_ruta_asignada": v.get("tipo_ruta", "SIN INFORMACIÓN"),
+                "prioridad_tipo_ruta": int(v.get("prioridad_tipo_ruta", 1)),
+                "es_tipo_priorizado": bool(v.get("es_tipo_priorizado", False)),
                 "secuencia": seq,
                 "id_punto_opt": p["id_punto_opt"],
                 "reserva": p["id_punto_opt"],
@@ -1404,7 +1504,7 @@ def optimizar_cached(puntos,flota,escenario,usar_osrm_matrix=True,usar_osrm_geom
             }
             out.append(row); details.append(row)
         coords.append(HUB_COORD); geom,ok,km=get_route_geometry(tuple(coords),usar_osrm=usar_osrm_geometry)
-        routes.append({"escenario":escenario,"id_ruta_optimizada":rid,"vehiculo_base":v["vehiculo_base"],"vuelta":v["vuelta_slot"],"bloque":v["bloque"],"capacidad":v["capacidad"],"resv_max":v.get("resv_max",np.nan),"bt":v.get("bt",np.nan),"factor_ocupacion":total_vol/v["capacidad"]*100,"color":color_from_text(f"{escenario}-{rid}"),"geometry":geom,"geometry_ok":ok,"stops":out,"total_os":total_os,"total_q_os_B":total_bt,"volumen":total_vol,"kilo_mayor":total_k,"paradas":len(out),"reservas":len(out),"km_estimado":km,"inicio_ruta":minutes_to_time(v["slot_start"]),"fin_ruta":minutes_to_time(a["fin_min"]),"tiempo_ruta_min":a["fin_min"]-v["slot_start"],"activo":True,"factible":True})
+        routes.append({"escenario":escenario,"id_ruta_optimizada":rid,"vehiculo_base":v["vehiculo_base"],"tipo_ruta":v.get("tipo_ruta","SIN INFORMACIÓN"),"prioridad_tipo_ruta":int(v.get("prioridad_tipo_ruta",1)),"es_tipo_priorizado":bool(v.get("es_tipo_priorizado",False)),"vuelta":v["vuelta_slot"],"bloque":v["bloque"],"capacidad":v["capacidad"],"resv_max":v.get("resv_max",np.nan),"bt":v.get("bt",np.nan),"factor_ocupacion":total_vol/v["capacidad"]*100,"color":color_from_text(f"{escenario}-{rid}"),"geometry":geom,"geometry_ok":ok,"stops":out,"total_os":total_os,"total_q_os_B":total_bt,"volumen":total_vol,"kilo_mayor":total_k,"paradas":len(out),"reservas":len(out),"km_estimado":km,"inicio_ruta":minutes_to_time(v["slot_start"]),"fin_ruta":minutes_to_time(a["fin_min"]),"tiempo_ruta_min":a["fin_min"]-v["slot_start"],"activo":True,"factible":True,"es_slot_sl5_am_obligatorio":bool(v.get("es_slot_sl5_am_obligatorio",False))})
     resumen=pd.DataFrame([{k:v for k,v in r.items() if k not in ["geometry","stops","color"]} for r in routes])
     meta={"status":"ok" if noas.empty else "ok_con_no_asignadas","matrix_source":"haversine/osrm_geometry","modelo":modelo,"no_asignadas":noas,"reservas_no_asignadas":len(noas)}
     return routes,pd.DataFrame(details),resumen,meta
@@ -1768,6 +1868,7 @@ GLOSARIO_EXPORT = [
     {"Hoja": "resumen_ejecutivo", "Descripción": "Una fila por día exportado: rutas, ocupación y productividad baseline vs. optimización de capacidades, y el motivo de bloqueo más frecuente."},
     {"Hoja": "macro_escenarios", "Descripción": "Métricas macro completas por día y escenario (Baseline / Optimización de capacidades)."},
     {"Hoja": "comparacion_tipos_ruta", "Descripción": "Cantidad de rutas físicas únicas por tipo de ruta, Baseline vs. Optimización de capacidades."},
+    {"Hoja": "resultado_priorizacion", "Descripción": "Auditoría de la jerarquía elegida: rutas disponibles, rutas usadas, reservas y volumen asignado por tipo de ruta."},
     {"Hoja": "baseline_detalle", "Descripción": "Detalle de gestiones (una fila por evento) de la operación real del día."},
     {"Hoja": "baseline_resumen_ruta", "Descripción": "Resumen operacional agregado por ruta física en el Baseline."},
     {"Hoja": "baseline_resumen_vuelta", "Descripción": "Resumen operacional agregado por ruta y vuelta (AM/PM) en el Baseline."},
@@ -1779,6 +1880,56 @@ GLOSARIO_EXPORT = [
     {"Hoja": "validaciones_dicruta", "Descripción": "Filas del diccionario de rutas con configuración inválida o inconsistente detectada al cargar el archivo."},
     {"Hoja": "dicruta_configuracion", "Descripción": "Copia del diccionario de rutas/capacidad utilizado en esta corrida, tal como fue interpretado por la app."},
 ]
+
+
+def construir_resumen_priorizacion(flota_cap, resumen_cap, tipos_ruta_priorizados):
+    """Explica qué tipos estaban disponibles y cuáles fueron activados.
+
+    Permite distinguir entre una prioridad que no se aplicó y una prioridad que
+    sí se aplicó pero no tenía rutas factibles/disponibles en el día.
+    """
+    prioridades = [str(x).strip().upper() for x in (tipos_ruta_priorizados or [])]
+    if flota_cap is None or flota_cap.empty:
+        return pd.DataFrame()
+
+    disp = flota_cap.copy()
+    disp["tipo_ruta_norm"] = disp.get("tipo_ruta", "SIN INFORMACIÓN").astype(str).str.strip().str.upper()
+    disponibles = (
+        disp.groupby(["tipo_ruta_norm", "prioridad_tipo_ruta", "es_tipo_priorizado"], dropna=False)
+        .agg(rutas_disponibles=("vehiculo_base", "nunique"), capacidad_disponible_m3=("capacidad", "sum"))
+        .reset_index()
+    )
+
+    if resumen_cap is None or resumen_cap.empty:
+        usados = pd.DataFrame(columns=["tipo_ruta_norm", "rutas_usadas", "reservas_asignadas", "volumen_asignado_m3"])
+    else:
+        usados_tmp = resumen_cap.copy()
+        usados_tmp["tipo_ruta_norm"] = usados_tmp.get("tipo_ruta", "SIN INFORMACIÓN").astype(str).str.strip().str.upper()
+        usados = (
+            usados_tmp.groupby("tipo_ruta_norm", dropna=False)
+            .agg(
+                rutas_usadas=("vehiculo_base", "nunique"),
+                reservas_asignadas=("reservas", "sum"),
+                volumen_asignado_m3=("volumen", "sum")
+            )
+            .reset_index()
+        )
+
+    out = disponibles.merge(usados, on="tipo_ruta_norm", how="left")
+    for c in ["rutas_usadas", "reservas_asignadas", "volumen_asignado_m3"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    out["jerarquia_usuario"] = out["tipo_ruta_norm"].apply(
+        lambda x: prioridades.index(x) + 1 if x in prioridades else len(prioridades) + 1
+    )
+    out["estado_prioridad"] = np.where(
+        out["es_tipo_priorizado"],
+        "Priorizada",
+        "No priorizada"
+    )
+    return out.rename(columns={"tipo_ruta_norm": "tipo_ruta"}).sort_values(
+        ["jerarquia_usuario", "rutas_usadas", "tipo_ruta"],
+        ascending=[True, False, True]
+    ).reset_index(drop=True)
 
 
 # ============================================================
@@ -1985,6 +2136,12 @@ def ejecutar_escenarios_dia(
         dicruta
     )
 
+    resumen_priorizacion = construir_resumen_priorizacion(
+        flota_cap,
+        resumen_cap,
+        tipos_ruta_priorizados
+    )
+
     met_base = metricas_baseline(
         baseline_completo,
         dicruta,
@@ -2060,6 +2217,7 @@ def ejecutar_escenarios_dia(
         no_asignadas_cap=no_asignadas_cap,
         diagnostico_baseline=diagnostico_baseline,
         comparacion_tipos_ruta=comparacion_tipos_ruta,
+        resumen_priorizacion=resumen_priorizacion,
         validaciones_dicruta=pd.DataFrame(
             DICRUTA_VALIDACIONES
         )
@@ -2234,8 +2392,25 @@ with tab_macro:
     if tipos_ruta_priorizados:
         st.caption(
             "Tipos de ruta priorizados en esta simulación: "
-            + ", ".join(tipos_ruta_priorizados)
+            + " > ".join(tipos_ruta_priorizados)
         )
+        resumen_prio_ui = sim.get("resumen_priorizacion", pd.DataFrame())
+        if not resumen_prio_ui.empty:
+            sin_disponibilidad = resumen_prio_ui[
+                resumen_prio_ui["es_tipo_priorizado"] &
+                (resumen_prio_ui["rutas_disponibles"] <= 0)
+            ]
+            if not sin_disponibilidad.empty:
+                st.warning(
+                    "Hay tipos priorizados sin rutas disponibles en el baseline del día: "
+                    + ", ".join(sin_disponibilidad["tipo_ruta"].astype(str))
+                )
+            with st.expander("Ver cómo se aplicó la prioridad", expanded=False):
+                st.caption(
+                    "La prioridad solo puede actuar sobre rutas disponibles en la flota del día. "
+                    "La tabla muestra rutas disponibles, rutas usadas y carga asignada por nivel."
+                )
+                st.dataframe(resumen_prio_ui, use_container_width=True, hide_index=True)
     estados_ok = {"ok", "ok_con_no_asignadas"}
     if sim.get("meta_cap", {}).get("status") not in estados_ok:
         st.warning("No fue posible generar la optimización de capacidades con los filtros seleccionados. Revisa la demanda disponible y vuelve a intentar.")
@@ -2670,7 +2845,7 @@ with tab_exportar:
 
             output_name = "baseline_optimizador_capacidades_export.xlsx"
             all_metrics=[]; all_baseline=[]; all_bl_ruta=[]; all_bl_vuelta=[]
-            all_opt_cap_res=[]; all_opt_cap_det=[]; all_puntos=[]; all_no_asig=[]; all_diag_bl=[]; all_tipos_ruta=[]
+            all_opt_cap_res=[]; all_opt_cap_det=[]; all_puntos=[]; all_no_asig=[]; all_diag_bl=[]; all_tipos_ruta=[]; all_prioridad=[]
 
             for f, sim_tmp in sims:
                 all_metrics.append(sim_tmp["metrics"].assign(fecha_export=f))
@@ -2683,6 +2858,7 @@ with tab_exportar:
                 all_no_asig.append(sim_tmp.get("no_asignadas_cap", pd.DataFrame()).assign(fecha_export=f))
                 all_diag_bl.append(sim_tmp.get("diagnostico_baseline", pd.DataFrame()).assign(fecha_export=f))
                 all_tipos_ruta.append(sim_tmp.get("comparacion_tipos_ruta", pd.DataFrame()).assign(fecha_export=f))
+                all_prioridad.append(sim_tmp.get("resumen_priorizacion", pd.DataFrame()).assign(fecha_export=f))
 
             resumen_ejecutivo_export = construir_resumen_ejecutivo_export(sims)
 
@@ -2691,6 +2867,7 @@ with tab_exportar:
                 resumen_ejecutivo_export.to_excel(writer, sheet_name="resumen_ejecutivo", index=False)
                 concatenar_no_vacios(all_metrics).to_excel(writer, sheet_name="macro_escenarios", index=False)
                 concatenar_no_vacios(all_tipos_ruta).to_excel(writer, sheet_name="comparacion_tipos_ruta", index=False)
+                concatenar_no_vacios(all_prioridad).to_excel(writer, sheet_name="resultado_priorizacion", index=False)
                 concatenar_no_vacios(all_baseline).to_excel(writer, sheet_name="baseline_detalle", index=False)
                 concatenar_no_vacios(all_bl_ruta).to_excel(writer, sheet_name="baseline_resumen_ruta", index=False)
                 concatenar_no_vacios(all_bl_vuelta).to_excel(writer, sheet_name="baseline_resumen_vuelta", index=False)
