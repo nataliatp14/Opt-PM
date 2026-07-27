@@ -65,7 +65,7 @@ EVENTOS_OPTIMIZABLES = ["PU", "CSC", "CNP", "NHP"]
 # Parámetros configurables para producción / Render.
 # Se pueden sobrescribir desde Environment Variables sin modificar el código.
 ORTOOLS_MAX_PUNTOS = int(os.getenv("ORTOOLS_MAX_PUNTOS", "180"))
-ORTOOLS_TIME_LIMIT_SECONDS = int(os.getenv("ORTOOLS_TIME_LIMIT_SECONDS", "20"))
+ORTOOLS_TIME_LIMIT_SECONDS = int(os.getenv("ORTOOLS_TIME_LIMIT_SECONDS", "8"))
 OSRM_MATRIX_TIMEOUT_SECONDS = int(os.getenv("OSRM_MATRIX_TIMEOUT_SECONDS", "20"))
 OSRM_ROUTE_TIMEOUT_SECONDS = int(os.getenv("OSRM_ROUTE_TIMEOUT_SECONDS", "12"))
 OSRM_MAX_MATRIX_POINTS = int(os.getenv("OSRM_MAX_MATRIX_POINTS", "90"))
@@ -1285,19 +1285,20 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
     def time_cb(fi,ti):
         f=manager.IndexToNode(fi); t=manager.IndexToNode(ti)
         return int(matrix[f][t]+(service[f] if f else 0))
-    # La dimensión de tiempo siempre usa tiempo real, sin penalizaciones de
-    # prioridad. Los costos de selección se aplican en callbacks separados.
+    # La dimensión de tiempo y el costo de viaje usan un único callback.
+    # La v21 registraba un callback diferente por cada vehículo/vuelta, lo que
+    # multiplicaba fuertemente el trabajo del solver. La prioridad por reserva
+    # ahora se aplica mediante la dimensión Reservations, más abajo.
     transit=routing.RegisterTransitCallback(time_cb)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit)
 
-    # Prioridad reforzada en dos capas:
+    # Prioridad en dos capas, sin callbacks por vehículo:
     # 1) costo fijo por ABRIR una ruta de menor jerarquía;
-    # 2) costo por CADA RESERVA asignada a esa ruta.
-    # Esto evita el defecto anterior: si una ruta no priorizada ya estaba
-    # abierta por una reserva restringida, podía recibir el resto de la carga
-    # sin ningún costo adicional.
+    # 2) costo por cantidad de reservas asignadas, aplicado como costo de span
+    #    en la dimensión Reservations. Mantiene el efecto de la v21 con una
+    #    estructura mucho más liviana para OR-Tools.
     niveles = int(vehiculos.get("cantidad_niveles_prioridad", pd.Series([0])).max())
     costos_prioridad_vehiculo = {}
-    callbacks_costo = []  # mantiene vivas las funciones durante la resolución
 
     for v, row in vehiculos.iterrows():
         prioridad = int(row.get("prioridad_tipo_ruta", niveles + 1 if niveles > 0 else 1))
@@ -1319,7 +1320,6 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
                     + PENALIZACION_ASIGNACION_NO_PRIORIZADA
                 )
         else:
-            nivel_recargo = 0
             recargo_apertura = 0
             recargo_asignacion = 0
 
@@ -1333,20 +1333,6 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
         routing.SetFixedCostOfVehicle(
             COSTO_FIJO_VEHICULO_ABIERTO + int(recargo_apertura), int(v)
         )
-
-        # El recargo se cobra al entrar a cada punto de demanda, pero no al
-        # volver al HUB. El tiempo/distancia siguen formando parte del costo.
-        def cost_cb(fi, ti, penalizacion=int(recargo_asignacion)):
-            f = manager.IndexToNode(fi)
-            t = manager.IndexToNode(ti)
-            costo = int(matrix[f][t] + (service[f] if f else 0))
-            if t != 0:
-                costo += penalizacion
-            return costo
-
-        callbacks_costo.append(cost_cb)
-        cost_idx = routing.RegisterTransitCallback(cost_cb)
-        routing.SetArcCostEvaluatorOfVehicle(cost_idx, int(v))
 
     routing.AddDimension(transit,30,1440,False,"Time"); td=routing.GetDimensionOrDie("Time")
     for n,p in enumerate(puntos.to_dict("records"),1):
@@ -1365,6 +1351,16 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
     max_count=max(len(puntos),1)
     count_caps=[int(r["resv_max"]) if pd.notna(r.get("resv_max",np.nan)) else max_count for _,r in vehiculos.iterrows()]
     routing.AddDimensionWithVehicleCapacity(countidx,0,count_caps,True,"Reservations")
+    reservas_dim = routing.GetDimensionOrDie("Reservations")
+
+    # El span de esta dimensión equivale al número de reservas de la ruta.
+    # Así se cobra el recargo por reserva según la jerarquía, sin crear un
+    # evaluador de arcos para cada vehículo.
+    for v in range(len(vehiculos)):
+        recargo = int(costos_prioridad_vehiculo.get(v, {}).get("recargo_asignacion", 0))
+        if recargo > 0:
+            reservas_dim.SetSpanCostCoefficientForVehicle(recargo, int(v))
+
     for n,p in enumerate(puntos.to_dict("records"),1):
         allowed=[]
         for v,row in vehiculos.iterrows():
@@ -1389,8 +1385,13 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
             vehicle_var.RemoveValue(-1)
         else:
             routing.AddDisjunction([idx], 10_000_000)
-    params=pywrapcp.DefaultRoutingSearchParameters(); params.first_solution_strategy=routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-    params.local_search_metaheuristic=routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH; params.time_limit.seconds=max(1, ORTOOLS_TIME_LIMIT_SECONDS)
+    params=pywrapcp.DefaultRoutingSearchParameters()
+    params.first_solution_strategy=routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+    # GREEDY_DESCENT termina al alcanzar un óptimo local. GUIDED_LOCAL_SEARCH
+    # de la v21 tendía a consumir siempre todo el límite de tiempo en cada día.
+    params.local_search_metaheuristic=routing_enums_pb2.LocalSearchMetaheuristic.GREEDY_DESCENT
+    params.time_limit.seconds=max(1, ORTOOLS_TIME_LIMIT_SECONDS)
+    params.use_full_propagation=False
     sol=routing.SolveWithParameters(params)
     if not sol: return None,None,matrix_source
     asign=[]; asignados=set()
@@ -1416,21 +1417,22 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
     return asign,dropped,matrix_source
 
 
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL_SECONDS, max_entries=64)
 def optimizar_cached(puntos,flota,escenario,usar_osrm_matrix=True,usar_osrm_geometry=True):
     if puntos.empty or flota.empty:
         noas=pd.DataFrame([_diagnosticar_no_asignada(p,{ }.get('x',pd.DataFrame())) for p in puntos.to_dict('records')]) if not puntos.empty else pd.DataFrame()
-        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_puntos_o_flota","modelo":"v21","no_asignadas":noas}
+        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_puntos_o_flota","modelo":"v22_rapida","no_asignadas":noas}
     puntos=puntos.reset_index(drop=True).copy(); vehiculos=_construir_vehiculos_v18(flota)
     if vehiculos.empty:
         noas=pd.DataFrame([_diagnosticar_no_asignada(p,vehiculos) for p in puntos.to_dict('records')])
-        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_vehiculos_factibles","modelo":"v21","no_asignadas":noas}
+        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_vehiculos_factibles","modelo":"v22_rapida","no_asignadas":noas}
     def travel(a,b): return int(math.ceil(haversine_km(a[0],a[1],b[0],b[1])*1.35/28*60))
     pendientes=puntos.sort_values(["tw_end","tw_start","volumen"],ascending=[True,True,False]).to_dict("records")
     asignaciones=[]
-    modelo="heuristica_v21_prioridad_reforzada"
+    modelo="heuristica_v22_prioridad_rapida"
     ort_asig, ort_drop, matrix_source = _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix)
     if ort_asig is not None:
-        asignaciones=ort_asig; pendientes=ort_drop; modelo="ortools_v21_prioridad_reforzada"
+        asignaciones=ort_asig; pendientes=ort_drop; modelo="ortools_v22_prioridad_rapida"
     for _,v in (vehiculos.iterrows() if ort_asig is None else []):
         if not pendientes: break
         cap=float(v["capacidad"]); cupo=float(v["resv_max"]) if pd.notna(v.get("resv_max",np.nan)) else math.inf
@@ -1542,7 +1544,7 @@ with st.sidebar:
     archivo_dicruta = st.file_uploader("Diccionario de rutas/capacidad (opcional)", type=["xlsx"], key="dicruta")
     st.caption("Si no cargas dicruta, el aplicativo intentará leer un archivo fijo llamado dicruta.xlsx junto al .py.")
     with st.expander("Información técnica", expanded=False):
-        st.caption(f"OR-Tools: hasta {ORTOOLS_MAX_PUNTOS} puntos · límite {ORTOOLS_TIME_LIMIT_SECONDS}s")
+        st.caption(f"OR-Tools rápido: hasta {ORTOOLS_MAX_PUNTOS} puntos · límite {ORTOOLS_TIME_LIMIT_SECONDS}s por día · resultados repetidos usan caché")
         st.caption(f"OSRM: {'deshabilitado' if DISABLE_OSRM else 'habilitado'}")
         if st.button("Limpiar caché", use_container_width=True):
             st.cache_data.clear()
