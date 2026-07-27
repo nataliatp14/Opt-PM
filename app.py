@@ -1114,12 +1114,37 @@ def preparar_puntos(df, cols, max_capacidad=None, dicruta=None):
 
     opt["sl5_vh_am_respetada"] = mask_anclada_con_vh_am
     opt["sl5_forzada_am_fuera_vh"] = mask_anclada_forzada_am
+
+    # Texto informativo dinámico: muestra la Hora-min configurada para la ruta
+    # en dicruta. Esta hora solo se utiliza en el mensaje exportado y no cambia
+    # ninguna regla, ventana ni decisión del optimizador.
+    hora_min_dicruta_map = (
+        dicruta.set_index("ruta")["hora_min_minutos"].to_dict()
+        if dicruta is not None and "hora_min_minutos" in dicruta.columns
+        else {}
+    )
+    hora_corte_mensaje_min = pd.to_numeric(
+        opt["ruta_original"].map(hora_min_dicruta_map),
+        errors="coerce"
+    ).fillna(HORA_CORTE_ANCLAJE_AM_MIN).astype(int)
+    hora_corte_mensaje_txt = hora_corte_mensaje_min.apply(minutes_to_time)
+    opt["hora_min_diccionario_mensaje_min"] = hora_corte_mensaje_min
+    opt["hora_min_diccionario_mensaje"] = hora_corte_mensaje_txt
+
+    mensaje_vh_am = (
+        "ETA obligatoria dentro del VH original y antes de las "
+        + hora_corte_mensaje_txt
+        + " (Hora-min diccionario)"
+    )
+    mensaje_forzada_am = (
+        "ETA obligatoria AM antes de las "
+        + hora_corte_mensaje_txt
+        + "; VH original sin cruce con horario AM (Hora-min diccionario)"
+    )
+
     opt["regla_horaria_sl5_mall"] = np.select(
         [mask_anclada_con_vh_am, mask_anclada_forzada_am],
-        [
-            "ETA obligatoria dentro del VH original y antes de las 13:00",
-            "ETA obligatoria AM; VH original sin cruce con horario AM"
-        ],
+        [mensaje_vh_am, mensaje_forzada_am],
         default="No aplica"
     )
     opt["factor_escala_capacidad"] = 1.0
@@ -1130,6 +1155,30 @@ def _cumple_ventana_original(reserva, eta_min):
     inicio = int(reserva.get("tw_start_original", reserva.get("tw_start", 0)))
     fin = int(reserva.get("tw_end_original", reserva.get("tw_end", 1439)))
     return inicio <= int(eta_min) <= fin
+
+
+def _mensaje_regla_horaria_sl5_mall_detalle(reserva, vehiculo):
+    """Construye el mensaje al generar el detalle, usando la Hora-min actual
+    de la ruta en la flota/diccionario. No modifica ninguna regla del solver.
+    """
+    if not bool(reserva.get("es_reserva_anclada_sl5_am", False)):
+        return "No aplica"
+
+    hora_min = vehiculo.get("hora_min_minutos", np.nan)
+    if pd.isna(hora_min):
+        hora_min = HORA_CORTE_ANCLAJE_AM_MIN
+    hora_txt = minutes_to_time(int(hora_min))
+
+    if bool(reserva.get("sl5_forzada_am_fuera_vh", False)):
+        return (
+            f"ETA obligatoria AM antes de las {hora_txt}; "
+            "VH original sin cruce con horario AM (Hora-min diccionario)"
+        )
+
+    return (
+        f"ETA obligatoria dentro del VH original y antes de las {hora_txt} "
+        "(Hora-min diccionario)"
+    )
 
 
 def _evaluar_estado_horario(reserva, eta_min):
@@ -1144,7 +1193,18 @@ def _evaluar_estado_horario(reserva, eta_min):
         return (
             False,
             "Fuera de horario · Forzada AM",
-            "reserva SL5 MALL obligada a gestionarse antes de las 13:00; su VH original no cruza el bloque AM"
+            (
+                "reserva SL5 MALL obligada a gestionarse antes de las "
+                + minutes_to_time(
+                    int(
+                        reserva.get(
+                            "hora_min_diccionario_mensaje_min",
+                            HORA_CORTE_ANCLAJE_AM_MIN
+                        )
+                    )
+                )
+                + "; su VH original no cruza el bloque AM"
+            )
         )
     return False, "Fuera de horario", "fuera de ventana horaria original"
 
@@ -1593,7 +1653,7 @@ def optimizar_cached(puntos,flota,escenario,usar_osrm_matrix=True,usar_osrm_geom
                 "ventana_horaria_usada_optimizador": f"{minutes_to_time(p.get('tw_start', 0))}-{minutes_to_time(p.get('tw_end', 1439))}",
                 "cumple_vh_estimado": cumple_original,
                 "estado_horario": it.get("estado_horario", "Cumple" if cumple_original else "Fuera de horario"),
-                "regla_horaria_sl5_mall": p.get("regla_horaria_sl5_mall", "No aplica"),
+                "regla_horaria_sl5_mall": _mensaje_regla_horaria_sl5_mall_detalle(p, v),
                 "sl5_vh_am_respetada": bool(p.get("sl5_vh_am_respetada", False)),
                 "sl5_forzada_am_fuera_vh": bool(p.get("sl5_forzada_am_fuera_vh", False)),
                 "compatible": True,
