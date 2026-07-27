@@ -70,15 +70,23 @@ OSRM_MATRIX_TIMEOUT_SECONDS = int(os.getenv("OSRM_MATRIX_TIMEOUT_SECONDS", "20")
 OSRM_ROUTE_TIMEOUT_SECONDS = int(os.getenv("OSRM_ROUTE_TIMEOUT_SECONDS", "12"))
 OSRM_MAX_MATRIX_POINTS = int(os.getenv("OSRM_MAX_MATRIX_POINTS", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
-PENALIZACION_RUTA_NO_PRIORIZADA = int(os.getenv("PENALIZACION_RUTA_NO_PRIORIZADA", "5000"))
-PENALIZACION_POR_NIVEL_PRIORIDAD = int(os.getenv("PENALIZACION_POR_NIVEL_PRIORIDAD", "5000"))
+PENALIZACION_RUTA_NO_PRIORIZADA = int(os.getenv("PENALIZACION_RUTA_NO_PRIORIZADA", "15000"))
+PENALIZACION_POR_NIVEL_PRIORIDAD = int(os.getenv("PENALIZACION_POR_NIVEL_PRIORIDAD", "10000"))
 # Penalización aplicada por CADA reserva asignada a una ruta de menor jerarquía.
 # La versión anterior solo penalizaba abrir el vehículo; una vez abierto, podía
 # absorber carga sin costo adicional y la prioridad dejaba de notarse.
-PENALIZACION_ASIGNACION_POR_NIVEL = int(os.getenv("PENALIZACION_ASIGNACION_POR_NIVEL", "1200"))
-PENALIZACION_ASIGNACION_NO_PRIORIZADA = int(os.getenv("PENALIZACION_ASIGNACION_NO_PRIORIZADA", "1800"))
+PENALIZACION_ASIGNACION_POR_NIVEL = int(os.getenv("PENALIZACION_ASIGNACION_POR_NIVEL", "3000"))
+PENALIZACION_ASIGNACION_NO_PRIORIZADA = int(os.getenv("PENALIZACION_ASIGNACION_NO_PRIORIZADA", "6000"))
 TIPO_RUTA_ANCLAJE_AM = os.getenv("TIPO_RUTA_ANCLAJE_AM", "SL5 MALL").strip().upper()
 HORA_CORTE_ANCLAJE_AM_MIN = int(os.getenv("HORA_CORTE_ANCLAJE_AM_MIN", str(13 * 60)))
+# La reserva MALL debe tener ETA antes de las 13:00, pero el regreso al HUB
+# puede ocurrir después. Este margen evita descartar la última parada AM solo
+# porque el vehículo no alcanza a volver al HUB exactamente a las 13:00.
+MARGEN_RETORNO_SL5_AM_MIN = int(os.getenv("MARGEN_RETORNO_SL5_AM_MIN", "120"))
+FIN_RETORNO_SL5_AM_MIN = min(
+    BLOQUE_AM_END_MIN,
+    HORA_CORTE_ANCLAJE_AM_MIN + max(0, MARGEN_RETORNO_SL5_AM_MIN)
+)
 # Costo fijo que paga el solver por cada vehículo/vuelta que decide abrir.
 # Es la palanca principal para el objetivo "menos rutas, mayor ocupación":
 # mientras más alto, más agresivamente el optimizador consolida carga en
@@ -1036,6 +1044,11 @@ def preparar_puntos(df, cols, max_capacidad=None, dicruta=None):
 
     opt["reserva"] = opt["id_punto_opt"].astype(str)
     opt["conteo_reserva"] = 1
+    # Se conserva si la reserva traía una ventana válida. Esto permite
+    # diferenciar una ventana real de la ventana de respaldo 00:00-23:59.
+    opt["ventana_original_valida"] = (
+        opt["ventana_inicio"].notna() & opt["ventana_fin"].notna()
+    )
     opt["tw_start_original"] = opt["ventana_inicio"].apply(
         lambda x: time_to_minutes(x) if pd.notna(x) else np.nan
     ).fillna(0).astype(int)
@@ -1044,6 +1057,7 @@ def preparar_puntos(df, cols, max_capacidad=None, dicruta=None):
     ).fillna(1439).astype(int)
     mask_invalida = opt["tw_start_original"] > opt["tw_end_original"]
     opt.loc[mask_invalida, ["tw_start_original", "tw_end_original"]] = [0, 1439]
+    opt.loc[mask_invalida, "ventana_original_valida"] = False
 
     opt["tw_start"] = opt["tw_start_original"]
     opt["tw_end"] = opt["tw_end_original"]
@@ -1071,13 +1085,43 @@ def preparar_puntos(df, cols, max_capacidad=None, dicruta=None):
         opt["es_reserva_anclada_sl5_am"], "AM", ""
     )
 
-    # Las reservas SL5 MALL gestionadas antes de las 13:00 se mantienen en su
-    # ruta AM original. Para ellas se relaja la ventana de la reserva durante
-    # la resolución; después se compara la ETA con la ventana original y se
-    # marca explícitamente como fuera de horario cuando corresponda.
+    # Regla horaria SL5 MALL AM:
+    # 1) si la ventana original tiene cruce con el bloque AM, la ETA debe quedar
+    #    DENTRO de ese cruce (por ejemplo 10:30-12:00 se respeta completo);
+    # 2) si la ventana es de tarde, por ejemplo 13:40-15:00, se fuerza de todas
+    #    formas una ETA AM entre 06:00 y 12:59 y luego se informa como fuera de VH.
     mask_anclada = opt["es_reserva_anclada_sl5_am"]
-    opt.loc[mask_anclada, "tw_start"] = BLOQUE_AM_START_MIN
-    opt.loc[mask_anclada, "tw_end"] = max(BLOQUE_AM_START_MIN, HORA_CORTE_ANCLAJE_AM_MIN - 1)
+    fin_am = max(BLOQUE_AM_START_MIN, HORA_CORTE_ANCLAJE_AM_MIN - 1)
+    inicio_interseccion = opt["tw_start_original"].clip(lower=BLOQUE_AM_START_MIN)
+    fin_interseccion = opt["tw_end_original"].clip(upper=fin_am)
+    tiene_cruce_am = (
+        opt["ventana_original_valida"]
+        & (inicio_interseccion <= fin_interseccion)
+    )
+
+    mask_anclada_con_vh_am = mask_anclada & tiene_cruce_am
+    mask_anclada_forzada_am = mask_anclada & ~tiene_cruce_am
+
+    # Cuando la ventana es AM o cruza parcialmente AM, se usa su intersección
+    # exacta con el bloque anterior a las 13:00.
+    opt.loc[mask_anclada_con_vh_am, "tw_start"] = inicio_interseccion[mask_anclada_con_vh_am].astype(int)
+    opt.loc[mask_anclada_con_vh_am, "tw_end"] = fin_interseccion[mask_anclada_con_vh_am].astype(int)
+
+    # Cuando la ventana es completamente PM (o no existe una ventana válida),
+    # se obliga la gestión AM aunque quede fuera de la ventana original.
+    opt.loc[mask_anclada_forzada_am, "tw_start"] = BLOQUE_AM_START_MIN
+    opt.loc[mask_anclada_forzada_am, "tw_end"] = fin_am
+
+    opt["sl5_vh_am_respetada"] = mask_anclada_con_vh_am
+    opt["sl5_forzada_am_fuera_vh"] = mask_anclada_forzada_am
+    opt["regla_horaria_sl5_mall"] = np.select(
+        [mask_anclada_con_vh_am, mask_anclada_forzada_am],
+        [
+            "ETA obligatoria dentro del VH original y antes de las 13:00",
+            "ETA obligatoria AM; VH original sin cruce con horario AM"
+        ],
+        default="No aplica"
+    )
     opt["factor_escala_capacidad"] = 1.0
     return opt.reset_index(drop=True)
 
@@ -1086,6 +1130,23 @@ def _cumple_ventana_original(reserva, eta_min):
     inicio = int(reserva.get("tw_start_original", reserva.get("tw_start", 0)))
     fin = int(reserva.get("tw_end_original", reserva.get("tw_end", 1439)))
     return inicio <= int(eta_min) <= fin
+
+
+def _evaluar_estado_horario(reserva, eta_min):
+    """Devuelve cumplimiento, etiqueta y motivo para mapa/exportación."""
+    cumple = _cumple_ventana_original(reserva, eta_min)
+    if cumple:
+        return True, "Cumple", ""
+    if (
+        bool(reserva.get("es_reserva_anclada_sl5_am", False))
+        and bool(reserva.get("sl5_forzada_am_fuera_vh", False))
+    ):
+        return (
+            False,
+            "Fuera de horario · Forzada AM",
+            "reserva SL5 MALL obligada a gestionarse antes de las 13:00; su VH original no cruza el bloque AM"
+        )
+    return False, "Fuera de horario", "fuera de ventana horaria original"
 
 
 def evaluar_compatibilidad_reserva_ruta(reserva, ruta, capacidad_disponible=None, reservas_disponibles=None, eta_min=None, fin_estimado=None):
@@ -1202,7 +1263,7 @@ def _construir_vehiculos_v18(flota):
                 "vuelta_slot": 1,
                 "bloque": "AM",
                 "slot_start": int(BLOQUE_AM_START_MIN),
-                "slot_end": int(HORA_CORTE_ANCLAJE_AM_MIN),
+                "slot_end": int(FIN_RETORNO_SL5_AM_MIN),
                 "es_slot_sl5_am_obligatorio": True,
                 "solo_reservas_ancladas_sl5_am": True
             })
@@ -1334,13 +1395,36 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
             COSTO_FIJO_VEHICULO_ABIERTO + int(recargo_apertura), int(v)
         )
 
-    routing.AddDimension(transit,30,1440,False,"Time"); td=routing.GetDimensionOrDie("Time")
+    # Permite esperar dentro de la ruta hasta que abra la siguiente ventana.
+    # Con solo 30 minutos de espera, dos reservas MALL con VH separados podían
+    # aparecer como incompatibles aunque ambas cupieran correctamente en AM.
+    routing.AddDimension(transit,TIEMPO_MAX_RUTA_MIN,1440,False,"Time"); td=routing.GetDimensionOrDie("Time")
     for n,p in enumerate(puntos.to_dict("records"),1):
         td.CumulVar(manager.NodeToIndex(n)).SetRange(int(p["tw_start"]),int(p["tw_end"]))
     for v,row in vehiculos.iterrows():
         td.CumulVar(routing.Start(v)).SetRange(int(row["slot_start"]),int(row["slot_end"]))
         td.CumulVar(routing.End(v)).SetRange(int(row["slot_start"]),int(row["slot_end"]))
         td.SetSpanUpperBoundForVehicle(TIEMPO_MAX_RUTA_MIN,v)
+
+    # Si una ruta SL5 MALL tiene slot histórico AM y slot normal PM, el PM no
+    # puede comenzar antes de que la vuelta AM haya regresado. Las ETA de las
+    # reservas obligatorias siguen limitadas a 12:59 por su ventana de nodo;
+    # solo se permite que el retorno al HUB ocurra hasta FIN_RETORNO_SL5_AM_MIN.
+    slots_am_por_ruta = {}
+    slots_pm_por_ruta = {}
+    for v, row in vehiculos.iterrows():
+        base = str(row.get("vehiculo_base", ""))
+        if bool(row.get("es_slot_sl5_am_obligatorio", False)):
+            slots_am_por_ruta[base] = int(v)
+        elif str(row.get("bloque", "")).upper() == "PM":
+            slots_pm_por_ruta[base] = int(v)
+    solver = routing.solver()
+    for base, v_am in slots_am_por_ruta.items():
+        v_pm = slots_pm_por_ruta.get(base)
+        if v_pm is not None:
+            solver.Add(
+                td.CumulVar(routing.Start(v_pm)) >= td.CumulVar(routing.End(v_am))
+            )
     SCALE=1000
     def cap_cb(idx):
         n=manager.IndexToNode(idx); return 0 if n==0 else int(math.ceil(float(puntos.iloc[n-1]["volumen"])*SCALE))
@@ -1403,13 +1487,14 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
                 p = puntos.iloc[n-1].to_dict()
                 eta_val = sol.Value(td.CumulVar(idx))
                 asignados.add(n-1)
-                cumple_original = _cumple_ventana_original(p, eta_val)
+                cumple_original, estado_horario, motivo_horario = _evaluar_estado_horario(p, eta_val)
                 stops.append({
                     "p": p,
                     "eta_min": eta_val,
                     "cumple_vh": cumple_original,
+                    "estado_horario": estado_horario,
                     "compatible": True,
-                    "motivos": "" if cumple_original else "fuera de ventana horaria original"
+                    "motivos": motivo_horario
                 })
             idx=sol.Value(routing.NextVar(idx))
         if stops: asign.append({"vehiculo":vehiculos.iloc[v].to_dict(),"stops":stops,"fin_min":sol.Value(td.CumulVar(idx))})
@@ -1421,43 +1506,61 @@ def _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix=True):
 def optimizar_cached(puntos,flota,escenario,usar_osrm_matrix=True,usar_osrm_geometry=True):
     if puntos.empty or flota.empty:
         noas=pd.DataFrame([_diagnosticar_no_asignada(p,{ }.get('x',pd.DataFrame())) for p in puntos.to_dict('records')]) if not puntos.empty else pd.DataFrame()
-        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_puntos_o_flota","modelo":"v22_rapida","no_asignadas":noas}
+        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_puntos_o_flota","modelo":"v24_prioridad_mall_validada","no_asignadas":noas}
     puntos=puntos.reset_index(drop=True).copy(); vehiculos=_construir_vehiculos_v18(flota)
     if vehiculos.empty:
         noas=pd.DataFrame([_diagnosticar_no_asignada(p,vehiculos) for p in puntos.to_dict('records')])
-        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_vehiculos_factibles","modelo":"v22_rapida","no_asignadas":noas}
+        return [],pd.DataFrame(),pd.DataFrame(),{"status":"sin_vehiculos_factibles","modelo":"v24_prioridad_mall_validada","no_asignadas":noas}
     def travel(a,b): return int(math.ceil(haversine_km(a[0],a[1],b[0],b[1])*1.35/28*60))
     pendientes=puntos.sort_values(["tw_end","tw_start","volumen"],ascending=[True,True,False]).to_dict("records")
     asignaciones=[]
-    modelo="heuristica_v22_prioridad_rapida"
+    modelo="heuristica_v24_prioridad_mall_validada"
     ort_asig, ort_drop, matrix_source = _resolver_ortools_v18(puntos, vehiculos, usar_osrm_matrix)
     if ort_asig is not None:
-        asignaciones=ort_asig; pendientes=ort_drop; modelo="ortools_v22_prioridad_rapida"
+        asignaciones=ort_asig; pendientes=ort_drop; modelo="ortools_v24_prioridad_mall_validada"
+    fin_am_por_vehiculo = {}
     for _,v in (vehiculos.iterrows() if ort_asig is None else []):
         if not pendientes: break
         cap=float(v["capacidad"]); cupo=float(v["resv_max"]) if pd.notna(v.get("resv_max",np.nan)) else math.inf
-        t=int(v["slot_start"]); pos=HUB_COORD; stops=[]
+        base_vehiculo = str(v.get("vehiculo_base", ""))
+        inicio_efectivo = int(v["slot_start"])
+        if (
+            str(v.get("bloque", "")).upper() == "PM"
+            and not bool(v.get("es_slot_sl5_am_obligatorio", False))
+        ):
+            inicio_efectivo = max(
+                inicio_efectivo,
+                int(fin_am_por_vehiculo.get(base_vehiculo, inicio_efectivo))
+            )
+        if inicio_efectivo >= int(v["slot_end"]):
+            continue
+        t=inicio_efectivo; pos=HUB_COORD; stops=[]
         while pendientes:
             candidatos=[]
             for i,p in enumerate(pendientes):
                 viaje=travel(pos,(float(p["lat"]),float(p["lon"]))); eta=max(t+viaje,int(p["tw_start"])); serv=int(math.ceil(TIEMPO_SERVICIO_BASE+float(p["os"])*TIEMPO_SERVICIO_OS)); ret=travel((float(p["lat"]),float(p["lon"])),HUB_COORD); fin=eta+serv+ret
                 ev=evaluar_compatibilidad_reserva_ruta(p,v,cap,cupo,eta,fin)
-                if fin-int(v["slot_start"])>TIEMPO_MAX_RUTA_MIN: ev["motivos"].append("supera duración máxima de ruta"); ev["compatible"]=False
+                if fin-inicio_efectivo>TIEMPO_MAX_RUTA_MIN: ev["motivos"].append("supera duración máxima de ruta"); ev["compatible"]=False
                 if fin>int(v["slot_end"]): ev["motivos"].append("incompatibilidad horaria: excede bloque operativo"); ev["compatible"]=False
                 if ev["compatible"]: candidatos.append((int(p["tw_end"]),viaje,-float(p["volumen"]),i,eta,serv))
             if not candidatos: break
             *_, idx, eta, serv = min(candidatos)
             p = pendientes.pop(idx)
-            cumple_original = _cumple_ventana_original(p, eta)
+            cumple_original, estado_horario, motivo_horario = _evaluar_estado_horario(p, eta)
             stops.append({
                 "p": p,
                 "eta_min": eta,
                 "cumple_vh": cumple_original,
+                "estado_horario": estado_horario,
                 "compatible": True,
-                "motivos": "" if cumple_original else "fuera de ventana horaria original"
+                "motivos": motivo_horario
             })
             cap -= float(p["volumen"]); cupo -= 1; t = eta + serv; pos = (float(p["lat"]), float(p["lon"]))
-        if stops: asignaciones.append({"vehiculo":v.to_dict(),"stops":stops,"fin_min":t+travel(pos,HUB_COORD)})
+        if stops:
+            fin_real = t + travel(pos,HUB_COORD)
+            asignaciones.append({"vehiculo":v.to_dict(),"stops":stops,"fin_min":fin_real})
+            if bool(v.get("es_slot_sl5_am_obligatorio", False)):
+                fin_am_por_vehiculo[base_vehiculo] = fin_real
     noas=pd.DataFrame([_diagnosticar_no_asignada(p,vehiculos,["no fue posible asignar con la capacidad, cupos y horarios remanentes"]) for p in pendientes])
     routes=[]; details=[]
     for rid,a in enumerate(asignaciones,1):
@@ -1487,8 +1590,12 @@ def optimizar_cached(puntos,flota,escenario,usar_osrm_matrix=True,usar_osrm_geom
                 "tw_start": p.get("tw_start_original", p["tw_start"]),
                 "tw_end": p.get("tw_end_original", p["tw_end"]),
                 "ventana_horaria_original": f"{minutes_to_time(p.get('tw_start_original', p['tw_start']))}-{minutes_to_time(p.get('tw_end_original', p['tw_end']))}",
+                "ventana_horaria_usada_optimizador": f"{minutes_to_time(p.get('tw_start', 0))}-{minutes_to_time(p.get('tw_end', 1439))}",
                 "cumple_vh_estimado": cumple_original,
-                "estado_horario": "Cumple" if cumple_original else "Fuera de horario",
+                "estado_horario": it.get("estado_horario", "Cumple" if cumple_original else "Fuera de horario"),
+                "regla_horaria_sl5_mall": p.get("regla_horaria_sl5_mall", "No aplica"),
+                "sl5_vh_am_respetada": bool(p.get("sl5_vh_am_respetada", False)),
+                "sl5_forzada_am_fuera_vh": bool(p.get("sl5_forzada_am_fuera_vh", False)),
                 "compatible": True,
                 "motivos_incompatibilidad": it.get("motivos", ""),
                 "es_reserva_anclada_sl5_am": bool(p.get("es_reserva_anclada_sl5_am", False)),
@@ -1610,11 +1717,27 @@ with st.sidebar:
                 orden_actual[i + 1], orden_actual[i] = orden_actual[i], orden_actual[i + 1]
                 st.session_state[orden_key] = orden_actual
                 st.rerun()
-        tipos_ruta_priorizados = list(st.session_state[orden_key])
-        st.caption("Jerarquía activa: " + " > ".join(tipos_ruta_priorizados))
+
+    # Estado único y persistente utilizado por análisis, mapas y exportación.
+    # Evita que la interfaz muestre una selección mientras la ejecución recibe
+    # accidentalmente una lista vacía en otro rerun de Streamlit.
+    prioridad_activa_key = "prioridad_rutas_activa"
+    prioridad_nueva = list(st.session_state.get(orden_key, []))
+    prioridad_anterior = list(st.session_state.get(prioridad_activa_key, []))
+    if prioridad_nueva != prioridad_anterior:
+        st.session_state[prioridad_activa_key] = prioridad_nueva
+        try:
+            optimizar_cached.clear()
+        except Exception:
+            pass
+    tipos_ruta_priorizados = list(st.session_state.get(prioridad_activa_key, []))
+
+    if tipos_ruta_priorizados:
+        st.success("Prioridad aplicada: " + " > ".join(tipos_ruta_priorizados))
+        st.caption("Esta misma jerarquía se usará en análisis, mapas y descarga Excel.")
     else:
-        tipos_ruta_priorizados = []
-        st.caption("Sin prioridad: se mantiene la lógica normal por capacidad y tiempo.")
+        st.warning("Optimización sin prioridad activa.")
+        st.caption("Selecciona al menos un tipo de ruta si quieres cambiar la asignación.")
 
 
 # Configuración y validaciones del diccionario v18
