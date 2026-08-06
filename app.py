@@ -1958,7 +1958,15 @@ def comparar_cantidad_por_tipo_ruta(baseline, resumen_cap, dicruta):
             .rename("Optimización de capacidades")
         )
 
-    comparacion = pd.concat([base_count, opt_count], axis=1).fillna(0).reset_index()
+    # Mantiene el nombre del índice incluso cuando opt_count está vacío.
+    # Sin rename_axis(), pandas puede crear una columna llamada "index" y
+    # luego fallar al ordenar por "Tipo de ruta".
+    comparacion = (
+        pd.concat([base_count, opt_count], axis=1)
+        .fillna(0)
+        .rename_axis("tipo_ruta")
+        .reset_index()
+    )
     comparacion["Baseline"] = comparacion["Baseline"].astype(int)
     comparacion["Optimización de capacidades"] = (
         comparacion["Optimización de capacidades"].astype(int)
